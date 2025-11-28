@@ -78,7 +78,7 @@ impl PythonArchBuilder {
     ///
     /// # Preconditions
     ///
-    /// - Symbol must be a File or Package type
+    /// - Symbol must be a File or Package type (or Function for deferred body processing)
     /// - Dependencies are not required (ARCH is the first phase)
     ///
     /// # Process
@@ -104,7 +104,7 @@ impl PythonArchBuilder {
     /// File: models.py
     ///   class Partner(models.Model):  -> Create ClassSymbol
     ///       def name_get(self):       -> Create FunctionSymbol
-    ///           x = 5                 -> Create VariableSymbol
+    ///           x = 5                 -> Create VariableSymbol (Deferred: body processed later)
     /// ```
     pub fn load_arch(&mut self, session: &mut SessionInfo) {
         let symbol = &self.sym_stack[0];
@@ -810,6 +810,8 @@ impl PythonArchBuilder {
         sym.borrow_mut().set_noqas(combine_noqa_info(&session.noqas_stack));
         session.current_noqa = sym.borrow().get_noqas().clone();
         //visit body
+        // Skip function body if it is a method when building file arch.
+        // It will be processed later when load_arch is called specifically on the function symbol.
         if !self.file_mode || sym.borrow().get_in_parents(&vec![SymType::CLASS], true).is_none() {
             sym.borrow_mut().as_func_mut().arch_status = BuildStatus::IN_PROGRESS;
             self.sym_stack.push(sym.clone());

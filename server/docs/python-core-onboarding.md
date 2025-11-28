@@ -493,9 +493,14 @@ fn visit_stmt_function_def(&mut self, stmt: &StmtFunctionDef, session: &mut Sess
 }
 ```
 
+**Deferred Method Body Evaluation**:
+For class methods, the body is **skipped** during the initial file ARCH build.
+- **Why?** Local variables in methods are not part of the module's public interface and shouldn't pollute the global symbol tree. Skipping them improves performance.
+- **When are they built?** Method bodies are processed when `load_arch` is called specifically on the function symbol (e.g., during validation or when the function is actively edited).
+
 **Import Resolution** (`core/import_resolver.rs`):
 - Iterates through entry points in resolution order (addons → main → builtins → public)
-- Navigates symbol tree to find imported modules/symbols
+- Navigates symbol tree to find resolved modules/symbols
 - Creates dependency: importing file → imported file
 - Stores `Evaluation` on import variable pointing to imported symbol
 
@@ -519,7 +524,7 @@ fn visit_stmt_function_def(&mut self, stmt: &StmtFunctionDef, session: &mut Sess
 
 **Hooks System** (`core/python_arch_eval_hooks.rs`):
 
-Hooks are triggered after file/function evaluation to inject Odoo-specific knowledge.
+Hooks are triggered after file/function evaluation to inject Odoo-specific knowledge. They exist for both ARCH (structure) and ARCH_EVAL (type inference) phases.
 
 Example hook: Inject `env` variable type in Odoo 18.1+
 ```rust
@@ -529,6 +534,7 @@ PythonArchEvalFileHook {
     if_exist_only: true,  // Only if tree path exists
     func: |session, entry, file_symbol, symbol| {
         // Inject: env is of type Environment
+        // This makes `self.env` resolve correctly in Odoo 18.1+ files
         let env_class = session.sync_odoo.get_symbol(..., vec!["Environment"]);
         symbol.borrow_mut().set_evaluations(vec![Evaluation { ... }]);
     }
@@ -621,18 +627,18 @@ pub struct ModelData {
 
 ```mermaid
 graph TD
-    M[Model: "res.partner"]
-    C1[ClassSymbol: Partner<br/>_name="res.partner"<br/>Module: base]
-    C2[ClassSymbol: Partner<br/>_inherit="res.partner"<br/>Module: sale]
-    C3[ClassSymbol: Partner<br/>_inherit="res.partner"<br/>Module: account]
+    M["Model: res.partner"]
+    C1["ClassSymbol: Partner<br/>_name=res.partner<br/>Module: base"]
+    C2["ClassSymbol: Partner<br/>_inherit=res.partner<br/>Module: sale"]
+    C3["ClassSymbol: Partner<br/>_inherit=res.partner<br/>Module: account"]
     
     M --> C1
     M --> C2
     M --> C3
     
-    F1[Fields: name, email]
-    F2[Fields: sale_order_count]
-    F3[Fields: credit_limit]
+    F1["Fields: name, email"]
+    F2["Fields: sale_order_count"]
+    F3["Fields: credit_limit"]
     
     C1 --> F1
     C2 --> F2
@@ -871,10 +877,10 @@ The `Context` type is a `HashMap<String, ContextValue>` that carries metadata th
 **Process**:
 1. Resolve `WEAK` pointers by upgrading weak references
 2. Follow import chains (`is_import_variable` → follow to imported symbol)
-3. Call `__get__` hooks for descriptors
+3. Call `__get__` hooks for descriptors (objects that control attribute access, like Odoo fields)
 4. Handle `SELF` and `ARG` special cases
 
-**Returns**: `Vec<EvaluationSymbol>` (can be multiple for union types)
+**Returns**: `Vec<EvaluationSymbol>` (can be multiple for union types or ambiguous control flow results)
 
 ---
 
@@ -896,15 +902,19 @@ pub struct EntryPoint {
 }
 
 pub enum EntryPointType {
-    ODOO,      // Odoo core (from odoo_path)
-    MAIN,      // Main workspace folder
-    ADDON,     // Addon path
+    MAIN,      // Main workspace folder or Odoo core path
+    ADDON,     // Addon path (from odoo.conf or auto-detected)
     BUILTIN,   // Python stdlib, typeshed
     PUBLIC,    // sys.path entries
-    CUSTOM,    // User-opened files
+    CUSTOM,    // User-opened files outside workspace
     UNTITLED,  // In-memory unsaved files
 }
 ```
+
+**Entry Point Concepts**:
+- **Root**: The filesystem root (`/`). All entry points are children of the root symbol.
+- **Main**: The primary project directory. If working on Odoo, this is the `odoo/` directory.
+- **Addons**: Directories containing Odoo modules. They share the same root namespace as Main for resolution.
 
 ### Entry Point Manager
 
@@ -921,19 +931,19 @@ pub struct EntryPointMgr {
 
 **Setup during initialization** (`SyncOdoo::initialize`):
 1. Create builtin entries: typeshed, stdlib, additional_stubs
-2. Create main entry: Odoo core path
-3. Create addon entries: Each addon path (share root with main entry)
+2. Create main entry: Odoo core path (if configured)
+3. Create addon entries: Each addon path (configured or detected)
 4. Create public entries: Paths from Python's `sys.path`
 
 ### Import Resolution Order
 
 ```mermaid
-graph LR
-    Import[import statement]
-    Addons[Addons Entries]
-    Main[Main Entry]
-    Builtins[Builtins]
-    Public[Public Entries]
+flowchart TD
+    Import["import statement"]
+    Addons["Addons Entries"]
+    Main["Main Entry"]
+    Builtins["Builtins"]
+    Public["Public Entries"]
     
     Import --> Addons
     Addons --> Main
@@ -992,7 +1002,7 @@ pub struct FileInfoAst {
 - **`update_file_info(path, content, version, is_external)`**: Load or update file
   - Applies incremental changes from LSP `didChange`
   - Parses AST with ruff
-  - Creates `IndexedModule` for O(1) AST node lookup by `NodeIndex`
+  - Creates `IndexedModule` for O(1) AST node lookup by `NodeIndex` (ruff-specific index)
   - Returns `(updated: bool, FileInfo)`
 
 - **`get_file_info(path)`**: Retrieve cached file info
@@ -1113,6 +1123,8 @@ sequenceDiagram
 6. **Set state**: `ODOO_READY`
 
 ### Symbol Lookup: `get_symbol()`
+
+// TODO: this is ok, but a bit out of place. The section before and the one after should not have this in between.
 
 **Signature**:
 ```rust
