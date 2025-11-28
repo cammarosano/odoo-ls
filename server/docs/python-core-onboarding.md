@@ -390,6 +390,8 @@ Each section tracks:
 
 ## 4. Build Pipeline
 
+> **Deep Dive**: For a detailed explanation of the pipeline, including hooks and examples, see [Python Build Pipeline](python-build-pipeline.md).
+
 The build pipeline consists of three phases that run sequentially for each symbol. Each phase depends on the previous phase being complete.
 
 ### Three-Phase Overview
