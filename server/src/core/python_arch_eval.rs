@@ -31,6 +31,32 @@ use super::python_utils::{Assign, AssignTargetType};
 use super::symbols::function_symbol::FunctionSymbol;
 
 
+/// Evaluator for the ARCH_EVAL (Architecture Evaluation) phase of the build pipeline.
+///
+/// # Purpose
+///
+/// The ARCH_EVAL phase performs type inference and evaluation:
+/// - Infer types for variables and expressions
+/// - Process decorators (Odoo-specific: `@api.depends`, `@api.model`, etc.)
+/// - Detect and infer Odoo field definitions
+/// - Store type information on symbols
+///
+/// # Process
+///
+/// 1. Verify ARCH phase is DONE
+/// 2. Visit assignments and type annotations
+/// 3. Call `Evaluation::analyze_ast()` for type inference
+/// 4. Process function decorators via hooks
+/// 5. Detect Odoo fields from decorators and usage patterns
+/// 6. Mark symbol as DONE, add to VALIDATION queue
+///
+/// # Hooks System
+///
+/// Hooks in `python_arch_eval_hooks.rs` inject Odoo-specific knowledge:
+/// - File-level hooks: Add implicit symbols (e.g., `env` variable in Odoo 18.1+)
+/// - Decorator hooks: Process `@api.depends` to infer field existence
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#phase-2-arch_eval-architecture-evaluation) for details.
 #[derive(Debug, Clone)]
 pub struct PythonArchEval {
     entry_point: Rc<RefCell<EntryPoint>>,
@@ -55,6 +81,41 @@ impl PythonArchEval {
         }
     }
 
+    /// Executes the ARCH_EVAL phase for a symbol (file or function).
+    ///
+    /// # Preconditions
+    ///
+    /// - Symbol's ARCH phase must be DONE
+    /// - Symbol must be in PENDING state for ARCH_EVAL
+    ///
+    /// # Process
+    ///
+    /// 1. **Verify prerequisites**: Check ARCH is DONE
+    /// 2. **Get AST**: Retrieve from `FileMgr` cache
+    /// 3. **Visit statements**:
+    ///    - `x = value` → Call `analyze_ast(value)`, store result in `x.evaluations`
+    ///    - `x: int = value` → Store annotation and inferred type
+    /// 4. **Process decorators**: Call hooks for Odoo patterns
+    ///    - `@api.depends('field')` → Infer `field` exists on model
+    ///    - `@api.model` → Function returns model instance
+    /// 5. **Detect fields**: `field_name = fields.Char()` → Store in `ModelData`
+    /// 6. **Apply hooks**: File-level hooks inject implicit symbols
+    /// 7. **Update status**: Mark ARCH_EVAL as DONE, add to VALIDATION queue
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session info with access to `SyncOdoo` state
+    ///
+    /// # Example Flow
+    ///
+    /// ```python
+    /// class Partner(models.Model):
+    ///     name = fields.Char()      # Detected as field, type: Char descriptor
+    ///     
+    ///     @api.depends('name')      # Hook infers 'name' field exists
+    ///     def _compute_display(self):
+    ///         x = self.name         # Type inference: x is str (via field descriptor)
+    /// ```
     pub fn eval_arch(&mut self, session: &mut SessionInfo) {
         let symbol = self.sym_stack[0].clone();
         if [SymType::NAMESPACE, SymType::ROOT, SymType::COMPILED, SymType::VARIABLE, SymType::CLASS].contains(&symbol.borrow().typ()) {

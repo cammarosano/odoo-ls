@@ -20,13 +20,42 @@ use super::evaluation::{Evaluation, EvaluationSymbolPtr, EvaluationSymbolWeak, E
 use super::file_mgr::{FileInfo, FileMgr};
 use super::python_arch_eval::PythonArchEval;
 
+/// Validator for the VALIDATION phase of the build pipeline.
+///
+/// # Purpose
+///
+/// The VALIDATION phase generates diagnostics (errors, warnings):
+/// - Check for undefined names and variables
+/// - Validate attribute access
+/// - Basic type checking
+/// - Odoo-specific validation (model fields, decorators, XML IDs)
+///
+/// # Process
+///
+/// 1. Verify ARCH_EVAL phase is DONE
+/// 2. Visit all expressions and statements
+/// 3. Validate names are defined before use
+/// 4. Check attributes exist on objects
+/// 5. Odoo-specific checks:
+///    - Model field existence: `record.unknown_field`
+///    - Decorator validity: `@api.depends` on valid fields
+///    - XML ID resolution: `self.env.ref('module.xml_id')`
+/// 6. Store diagnostics, publish to LSP client
+///
+/// # Diagnostics Storage
+///
+/// - File-level: Stored in `FileInfo.diagnostics[VALIDATION]`
+/// - Function-level: Stored in `FunctionSymbol.diagnostics[VALIDATION]`
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#phase-3-validation) for details.
 #[derive(Debug)]
 pub struct PythonValidator {
     entry_point: Rc<RefCell<EntryPoint>>,
     file: Rc<RefCell<Symbol>>,
     file_mode: bool,
     sym_stack: Vec<Rc<RefCell<Symbol>>>,
-    pub diagnostics: Vec<Diagnostic>, //collect diagnostic from arch and arch_eval too from inner functions, but put everything at Validation level
+    /// Collects diagnostics from arch and arch_eval phases for functions
+    pub diagnostics: Vec<Diagnostic>,
     safe_imports: Vec<bool>,
     current_module: Option<Rc<RefCell<Symbol>>>,
     file_info: Option<Rc<RefCell<FileInfo>>>,
@@ -70,7 +99,40 @@ impl PythonValidator {
         Some(file_info_rc)
     }
 
-    /* Validate the symbol. The dependencies must be done before any validation. */
+    /// Executes the VALIDATION phase for a symbol (file or function).
+    ///
+    /// # Preconditions
+    ///
+    /// - Symbol's ARCH_EVAL phase must be DONE
+    /// - Symbol must be in PENDING state for VALIDATION
+    /// - All dependencies must be built
+    ///
+    /// # Process
+    ///
+    /// 1. **Verify prerequisites**: Check ARCH_EVAL is DONE
+    /// 2. **Get file info**: Retrieve from `FileMgr`
+    /// 3. **Visit AST**: Traverse all expressions
+    ///    - Name references → Check if defined in scope
+    ///    - Attribute access → Verify attribute exists
+    ///    - Function calls → Check callable
+    /// 4. **Odoo validations**:
+    ///    - `record.field` → Check field exists in model
+    ///    - `@api.depends('field')` → Verify field is valid
+    ///    - `env.ref('xml_id')` → Check XML ID exists
+    /// 5. **Store diagnostics**: Add to `FileInfo` or `FunctionSymbol`
+    /// 6. **Update status**: Mark VALIDATION as DONE
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session info with access to `SyncOdoo` state
+    ///
+    /// # Example Diagnostics
+    ///
+    /// ```python
+    /// x = undefined_var        # Error: 'undefined_var' is not defined
+    /// partner.invalid_field    # Error: 'res.partner' has no field 'invalid_field'
+    /// @api.depends('bad')      # Warning: Field 'bad' not found on model
+    /// ```
     pub fn validate(&mut self, session: &mut SessionInfo) {
         self.file = self.sym_stack[0].borrow().get_file().unwrap().upgrade().unwrap();
         let symbol = self.sym_stack[0].borrow();

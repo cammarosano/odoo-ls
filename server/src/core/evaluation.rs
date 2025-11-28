@@ -22,13 +22,33 @@ use super::symbols::symbol::Symbol;
 use super::symbols::symbol_mgr::SectionIndex;
 
 
+/// Represents the literal value of an evaluation if it can be determined at analysis time.
+///
+/// # Variants
+///
+/// - `ANY`: Value cannot be determined statically
+/// - `CONSTANT`: Literal value (number, string, bool, etc.)
+/// - `DICT`/`LIST`/`TUPLE`: Collection literals with known elements
+///
+/// # Example
+///
+/// ```python
+/// x = 5                    # CONSTANT(NumberLiteral(5))
+/// y = [1, 2, 3]            # LIST([1, 2, 3])
+/// z = some_function()      # ANY (cannot determine value)
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvaluationValue {
-    ANY(), //we don't know what it is, so it can be everything !
-    CONSTANT(ruff_python_ast::Expr), //expr is a literal
-    DICT(Vec<(ruff_python_ast::Expr, ruff_python_ast::Expr)>), //expr is a literal
-    LIST(Vec<ruff_python_ast::Expr>), //expr is a literal
-    TUPLE(Vec<ruff_python_ast::Expr>) //expr is a literal
+    /// Unknown value (cannot be determined statically)
+    ANY(),
+    /// Literal constant expression
+    CONSTANT(ruff_python_ast::Expr),
+    /// Dictionary literal with key-value pairs
+    DICT(Vec<(ruff_python_ast::Expr, ruff_python_ast::Expr)>),
+    /// List literal with known elements
+    LIST(Vec<ruff_python_ast::Expr>),
+    /// Tuple literal with known elements
+    TUPLE(Vec<ruff_python_ast::Expr>)
 }
 
 impl EvaluationValue {
@@ -68,12 +88,44 @@ impl EvaluationValue {
     }
 }
 
+/// Represents the inferred type and value of a Python expression.
+///
+/// # Fields
+///
+/// - `symbol`: The type symbol (e.g., points to `str` class, `int` class, etc.)
+/// - `value`: Optional literal value if expression is a constant
+/// - `range`: Source code location of the evaluated expression
+///
+/// # Usage
+///
+/// Evaluations are stored on:
+/// - `VariableSymbol.evaluations`: Type(s) of a variable
+/// - `FunctionSymbol.evaluations`: Inferred return type(s)
+///
+/// Can have multiple evaluations for ambiguous cases:
+/// ```python
+/// x = "str" if condition else 5  # evaluations: [Evaluation{str}, Evaluation{int}]
+/// ```
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let eval = Evaluation {
+///     symbol: EvaluationSymbol::pointing_to(str_class),
+///     value: Some(EvaluationValue::CONSTANT("hello")),
+///     range: Some(expr.range()),
+/// };
+/// ```
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#core-types) for details.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Evaluation {
-    //symbol lead to type evaluation, and value/range hold the evaluated value in case of a 'constant' value, like in "variable = 5".
+    /// Type symbol (points to class, builtin, etc.)
     pub symbol: EvaluationSymbol,
-    pub value: Option<EvaluationValue>, //
-    pub range: Option<TextRange>, //evaluated part
+    /// Literal value if this is a constant expression
+    pub value: Option<EvaluationValue>,
+    /// Source location of the evaluated expression
+    pub range: Option<TextRange>,
 }
 
 #[derive(Debug)]
@@ -115,13 +167,37 @@ impl ExprOrIdent<'_> {
 
 }
 
+/// Additional metadata carried through type inference via the `Context` map.
+///
+/// # Common Context Keys
+///
+/// - `"MODULE"`: Current module symbol (for relative imports)
+/// - `"base_attr"`: Base object for attribute access (`obj` in `obj.attr`)
+/// - `"self_sym"`: Object instance for method calls
+/// - `"comodel_name"`: Target model name for Odoo relational fields
+/// - `"arguments"`: Call arguments for parameter type matching
+/// - `"range"`: Source range of expression
+///
+/// # Example
+///
+/// ```python
+/// self.env['res.partner'].search([])
+/// # Context during evaluation:
+/// # - "self_sym" = Partner class instance
+/// # - "comodel_name" = "res.partner"
+/// # - "arguments" = Arguments for search()
+/// ```
 #[derive(Debug, Clone)]
 pub enum ContextValue {
     BOOLEAN(bool),
     STRING(String),
+    /// Module symbol (weak reference)
     MODULE(Weak<RefCell<Symbol>>),
+    /// Symbol reference for context (weak)
     SYMBOL(Weak<RefCell<Symbol>>),
+    /// Function call arguments
     ARGUMENTS(Arguments),
+    /// Source code range
     RANGE(TextRange)
 }
 
@@ -183,21 +259,28 @@ impl ContextValue {
     }
 }
 
-/** A context can contains: (non-exhaustive)
-* module: the current module the file belongs to
-* parent: in an expression, like self.test, the parent is the base attribute, so 'self' for test
-* object: the object the expression is executed on (useful if function is defined in parent object).
-*/
+/// Context map for carrying metadata through type inference.
+///
+/// Used in `Evaluation::analyze_ast()` to pass additional information like
+/// current module, base object for attribute access, etc.
 pub type Context = HashMap<String, ContextValue>;
 
-/**
- * A hook will receive:
- * session: current active session
- * eval: the evaluationSymbol the hook is executed on
- * context: if provided, can contains useful information
- * diagnostics: a vec the hook can fill to add diagnostics
- * file_symbol: if provided, can be used to add dependencies
- */
+/// Hook function for custom symbol resolution (used for Odoo descriptors).
+///
+/// Hooks are called when dereferencing an evaluation to resolve special cases
+/// like field descriptors (`fields.Char.__get__` returns `str`).
+///
+/// # Parameters
+///
+/// - `session`: Current session with access to `SyncOdoo`
+/// - `eval`: The evaluation symbol being dereferenced
+/// - `context`: Mutable context (can be updated by hook)
+/// - `diagnostics`: Can add diagnostics
+/// - `scope`: Optional scope symbol
+///
+/// # Returns
+///
+/// Optional new evaluation symbol to use instead of the original.
 type GetSymbolHook = fn (session: &mut SessionInfo, eval: &EvaluationSymbol, context: &mut Option<Context>, diagnostics: &mut Vec<Diagnostic>, scope: Option<Rc<RefCell<Symbol>>>) -> Option<EvaluationSymbolPtr>;
 
 
@@ -234,21 +317,64 @@ impl EvaluationSymbolWeak {
     }
 }
 
+/// Pointer to the type symbol for an evaluation.
+///
+/// # Variants
+///
+/// - `WEAK(...)`: Reference to a symbol (class, builtin, etc.)
+/// - `SELF`: The `self` parameter in a method
+/// - `ARG(n)`: Function argument by index
+/// - `DOMAIN`: Odoo domain expression `[(field, op, value), ...]`
+/// - `NONE`: `None` literal
+/// - `UNBOUND(name)`: Name that couldn't be resolved
+/// - `ANY`: Unknown/ambiguous type
+///
+/// # Example
+///
+/// ```python
+/// x: str = "hello"    # WEAK(str class symbol)
+/// def f(self, arg):   # self: SELF, arg: ARG(1)
+///     pass
+/// ```
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum EvaluationSymbolPtr {
+    /// Weak reference to a symbol
     WEAK(EvaluationSymbolWeak),
+    /// The 'self' parameter
     SELF,
+    /// Function argument by index
     ARG(u32),
+    /// Odoo domain expression
     DOMAIN,
+    /// None literal
     NONE,
+    /// Unresolved name
     UNBOUND(OYarn),
+    /// Unknown type (default)
     #[default]
     ANY
 }
 
+/// Symbol reference with optional custom resolution hook.
+///
+/// Wraps an `EvaluationSymbolPtr` and optionally a `GetSymbolHook` for
+/// custom dereferencing logic (used for Odoo field descriptors).
+///
+/// # Field Descriptor Example
+///
+/// ```python
+/// class Char(Field):
+///     def __get__(self, instance, owner):
+///         return ""  # Returns str
+///
+/// class Partner(models.Model):
+///     name = fields.Char()  # name has hook that returns str type
+/// ```
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct EvaluationSymbol {
+    /// Type symbol pointer
     sym: EvaluationSymbolPtr,
+    /// Optional hook for custom resolution (e.g., field __get__)
     pub get_symbol_hook: Option<GetSymbolHook>,
 }
 
@@ -648,29 +774,48 @@ impl Evaluation {
     }
 
 
-    /**
-    analyze_ast will extract all known information about an ast:
-    result.0: the direct evaluation
-    result.3: the context after the evaluation. Can't be None
-    result.4: the diagnostics that code is generating.
-    Example:
-        --------
-        context
-        --------
-        A| class Char():
-        B|     def __get__(self, instance, owner=None):
-        C|         return ""
-        D| MyChar = Char
-        E| class Test():
-        G|     a = MyChar()
-        H| test = Test()
-        --------
-        result of analyze_ast("test.a") (with adapted parameters)
-        --------
-        symbol/evaluation: a (at G)
-        context: {}
-        diagnostics: vec![]
-     */
+    /// Main type inference algorithm for Python expressions.
+    ///
+    /// # Purpose
+    ///
+    /// Analyzes a Python AST expression and infers its type(s) and value(s).
+    /// This is the core of the type system, used during ARCH_EVAL phase.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session with access to `SyncOdoo` state
+    /// * `ast` - Expression to analyze (can be `Expr`, `Identifier`, or `Parameter`)
+    /// * `parent` - Current scope symbol (file, class, or function)
+    /// * `max_infer` - Don't infer symbols defined after this position (for visibility)
+    /// * `context` - Mutable context map for metadata (module, base_attr, etc.)
+    /// * `for_annotation` - True if analyzing a type annotation
+    /// * `required_dependencies` - Output: dependencies required for this inference
+    ///
+    /// # Returns
+    ///
+    /// `AnalyzeAstResult` containing:
+    /// - `evaluations`: Possible types (can be multiple for ambiguous expressions)
+    /// - `diagnostics`: Any errors/warnings generated during inference
+    ///
+    /// # Expression Handling
+    ///
+    /// - **Name**: Look up in scope via `get_content_symbol()`
+    /// - **Attribute**: Infer base object, then find member
+    /// - **Call**: Infer function, extract return type
+    /// - **Literal**: Return builtin type (int, str, etc.)
+    /// - **BinOp**: Infer operands, apply operator rules
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// x = self.partner_id.name  # Inference chain:
+    /// # 1. self -> Partner class instance
+    /// # 2. partner_id -> Many2one field, returns res.partner instance
+    /// # 3. name -> Char field, returns str
+    /// # Result: x has type str
+    /// ```
+    ///
+    /// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#the-analyze_ast-algorithm) for details.
     pub fn analyze_ast(session: &mut SessionInfo, ast: &ExprOrIdent, parent: Rc<RefCell<Symbol>>, max_infer: &TextSize, context: &mut Option<Context>, for_annotation: bool, required_dependencies: &mut Vec<Vec<Rc<RefCell<Symbol>>>>) -> AnalyzeAstResult {
         let odoo = &mut session.sync_odoo;
         let mut evals = vec![];

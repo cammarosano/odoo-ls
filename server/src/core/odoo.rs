@@ -60,40 +60,98 @@ pub enum InitState {
     ODOO_READY,
 }
 
+/// Central state manager for the Odoo Language Server.
+///
+/// # Purpose
+///
+/// `SyncOdoo` is the main orchestrator that coordinates all language server operations:
+/// - Initialize and manage entry points (Odoo core, addons, stdlib, etc.)
+/// - Store and lookup symbols in the symbol tree
+/// - Track Odoo modules and models
+/// - Manage build queues for the three-phase pipeline
+/// - Handle file changes and invalidation
+/// - Provide LSP feature implementations (completion, hover, etc.)
+///
+/// # Threading
+///
+/// Wrapped in `Arc<Mutex<SyncOdoo>>` for thread-safe access from:
+/// - Main LSP handler thread
+/// - Delayed processing thread (debounced rebuilds)
+///
+/// # State Lifecycle
+///
+/// ```text
+/// NOT_READY -> initialize() -> PYTHON_READY -> load_odoo() -> ODOO_READY
+/// ```
+///
+/// # Build Queues
+///
+/// Three queues for the build pipeline:
+/// - `rebuild_arch`: Symbols needing ARCH phase (parse, build symbol tree)
+/// - `rebuild_arch_eval`: Symbols needing ARCH_EVAL phase (type inference)
+/// - `rebuild_validation`: Symbols needing VALIDATION phase (diagnostics)
+///
+/// Processed by `process_rebuilds()` which runs all three phases sequentially.
+///
+/// # Key Collections
+///
+/// - `modules`: Odoo modules by name (e.g., "sale", "account")
+/// - `models`: Odoo models by _name (e.g., "res.partner", "sale.order")
+/// - `entry_point_mgr`: Manages Python execution contexts
+/// - `file_mgr`: File content cache and AST storage
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#syncodoo-structure) for details.
 #[derive(Debug)]
 pub struct SyncOdoo {
+    // Version info
     pub version_major: u32,
     pub version_minor: u32,
     pub version_micro: u32,
     pub full_version: String,
     pub python_version: Vec<u32>,
+    
+    // Configuration
     pub config: ConfigEntry,
     pub config_file: Option<ConfigFile>,
     pub config_path: Option<String>,
-    pub entry_point_mgr: Rc<RefCell<EntryPointMgr>>, //An Rc to be able to clone it and free session easily
+    
+    // Entry point management
+    pub entry_point_mgr: Rc<RefCell<EntryPointMgr>>,
     pub has_main_entry:bool,
     pub has_odoo_main_entry: bool,
     pub has_valid_python: bool,
     pub main_entry_tree: Vec<OYarn>,
     pub stubs_dirs: Vec<String>,
     pub stdlib_dir: String,
+    
     pub progress_token: i32,
     file_mgr: Rc<RefCell<FileMgr>>,
+    
+    /// Odoo modules: module_name -> module symbol
     pub modules: HashMap<OYarn, Weak<RefCell<Symbol>>>,
+    /// Odoo models: model_name -> Model (aggregates all extending classes)
     pub models: HashMap<OYarn, Rc<RefCell<Model>>>,
+    
+    // Cancellation flags
     pub interrupt_rebuild: Arc<AtomicBool>,
     pub terminate_rebuild: Arc<AtomicBool>,
     pub current_request_id: Option<RequestId>,
-    pub running_request_ids: Arc<Mutex<Vec<RequestId>>>, //Arc to Server mutex for cancellation support
+    pub running_request_ids: Arc<Mutex<Vec<RequestId>>>,
+    
     pub watched_file_updates: u32,
+    
+    // Build queues (weak references, auto-cleanup deallocated symbols)
     rebuild_arch: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
     rebuild_arch_eval: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
     rebuild_validation: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
+    
     pub state_init: InitState,
     pub must_reload_paths: Vec<(Weak<RefCell<Symbol>>, String)>,
-    pub load_odoo_addons: bool, //indicate if we want to load odoo addons or not
-    pub need_rebuild: bool, //if true, the next process_rebuilds will drop everything and rebuild everything
+    pub load_odoo_addons: bool,
+    pub need_rebuild: bool,
     pub import_cache: Option<ImportCache>,
+    
+    // LSP capabilities
     pub capabilities: lsp_types::ClientCapabilities,
     pub encoding: PositionEncoding,
     pub opened_files: Vec<String>,
@@ -504,7 +562,37 @@ impl SyncOdoo {
         session.sync_odoo.state_init = InitState::ODOO_READY;
     }
 
-    //search for a symbol with a tree local to an unknown entrypoint
+    /// Looks up symbols in the symbol tree by path and position.
+    ///
+    /// # Purpose
+    ///
+    /// Primary method for navigating the symbol tree. Used throughout the codebase
+    /// to find types, resolve imports, lookup Odoo models, etc.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_path` - Starting file path, or "" to search all entry points
+    /// * `tree` - Symbol path to navigate:
+    ///   - `tree.0`: File path components (e.g., `["odoo", "models"]` -> `odoo/models/__init__.py`)
+    ///   - `tree.1`: Content path components (e.g., `["BaseModel", "env"]` -> member navigation)
+    /// * `position` - Maximum text position for visibility (symbols defined after are excluded)
+    ///
+    /// # Returns
+    ///
+    /// All matching symbols (can be multiple for ambiguous names or union types).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Find odoo.models.BaseModel.env
+    /// let symbols = sync_odoo.get_symbol(
+    ///     "/path/to/odoo",
+    ///     &(vec![Sy!("odoo"), Sy!("models")], vec![Sy!("BaseModel"), Sy!("env")]),
+    ///     u32::MAX
+    /// );
+    /// ```
+    ///
+    /// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#symbol-lookup-get_symbol) for details.
     pub fn get_symbol(&self, from_path: &str, tree: &Tree, position: u32) -> Vec<Rc<RefCell<Symbol>>> {
         //find which entrypoint to use
         for entry in self.entry_point_mgr.borrow().iter_all() {
@@ -633,6 +721,43 @@ impl SyncOdoo {
         });
     }
 
+    /// Processes all pending rebuild queues through the three-phase build pipeline.
+    ///
+    /// # Purpose
+    ///
+    /// Main entry point for executing builds. Processes symbols in all three queues:
+    /// 1. **ARCH**: Parse files, build symbol tree, resolve imports
+    /// 2. **ARCH_EVAL**: Type inference and evaluation
+    /// 3. **VALIDATION**: Generate diagnostics
+    ///
+    /// # Process
+    ///
+    /// 1. Reset cancellation flag
+    /// 2. Initialize import cache
+    /// 3. Start progress reporting to LSP client
+    /// 4. While queues not empty:
+    ///    - Process ARCH queue (builds `rebuild_arch_eval` queue)
+    ///    - Process ARCH_EVAL queue (builds `rebuild_validation` queue)
+    ///    - Process VALIDATION queue
+    ///    - Check for cancellation between steps
+    /// 5. Publish all diagnostics to LSP client
+    /// 6. Clear import cache
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session with access to `SyncOdoo`
+    /// * `no_validation` - If true, skip VALIDATION phase (for faster rebuilds)
+    ///
+    /// # Returns
+    ///
+    /// `true` if rebuilds completed successfully, `false` if too many file updates (needs restart).
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `interrupt_rebuild` flag between batches. If set, stops processing
+    /// and publishes current diagnostics.
+    ///
+    /// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#rebuild-queue-processing) for details.
     pub fn process_rebuilds(session: &mut SessionInfo, no_validation: bool) -> bool {
         session.sync_odoo.interrupt_rebuild.store(false, Ordering::SeqCst);
         if session.sync_odoo.watched_file_updates > MAX_WATCHED_FILES_UPDATES_BEFORE_RESTART {

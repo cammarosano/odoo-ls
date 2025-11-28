@@ -28,6 +28,26 @@ use super::symbols::module_symbol::ModuleSymbol;
 use super::symbols::symbol_mgr::SectionIndex;
 
 
+/// Builder for the ARCH (Architecture) phase of the build pipeline.
+///
+/// # Purpose
+///
+/// The ARCH phase parses Python files and builds the initial symbol tree:
+/// - Parse AST using ruff_python_parser
+/// - Create symbols for classes, functions, variables
+/// - Resolve import statements
+/// - Establish file-to-file dependencies
+/// - Create sections for control flow (if/else, try/except, loops)
+///
+/// # Process
+///
+/// 1. Get or parse AST from `FileMgr`
+/// 2. Visit all statements in the AST
+/// 3. Create appropriate symbols (Class, Function, Variable)
+/// 4. Resolve imports to establish dependencies
+/// 5. Mark symbol as DONE or add to next phase queue
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#phase-1-arch-architecture) for details.
 #[derive(Debug)]
 pub struct PythonArchBuilder {
     entry_point: Rc<RefCell<EntryPoint>>,
@@ -54,6 +74,38 @@ impl PythonArchBuilder {
         }
     }
 
+    /// Executes the ARCH phase for a symbol (file or package).
+    ///
+    /// # Preconditions
+    ///
+    /// - Symbol must be a File or Package type
+    /// - Dependencies are not required (ARCH is the first phase)
+    ///
+    /// # Process
+    ///
+    /// 1. **Load module info**: For Odoo modules, load `__manifest__.py`
+    /// 2. **Get AST**: Retrieve from `FileMgr` cache or parse file
+    /// 3. **Visit AST**: Traverse all statements
+    ///    - `class` → Create `ClassSymbol`
+    ///    - `def` → Create `FunctionSymbol`
+    ///    - `x = value` → Create `VariableSymbol`
+    ///    - `import` / `from ... import` → Resolve and create import variables
+    /// 4. **Control flow**: Create sections for if/elif/else, try/except, loops
+    /// 5. **Store diagnostics**: Syntax errors and import issues
+    /// 6. **Update status**: Mark ARCH as DONE, add to ARCH_EVAL queue
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session info with access to `SyncOdoo` state
+    ///
+    /// # Example Flow
+    ///
+    /// ```text
+    /// File: models.py
+    ///   class Partner(models.Model):  -> Create ClassSymbol
+    ///       def name_get(self):       -> Create FunctionSymbol
+    ///           x = 5                 -> Create VariableSymbol
+    /// ```
     pub fn load_arch(&mut self, session: &mut SessionInfo) {
         let symbol = &self.sym_stack[0];
         if [SymType::NAMESPACE, SymType::ROOT, SymType::COMPILED, SymType::VARIABLE, SymType::CLASS].contains(&symbol.borrow().typ()) {

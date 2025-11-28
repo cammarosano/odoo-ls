@@ -39,6 +39,39 @@ use super::symbol_mgr::{ContentSymbols, SymbolMgr};
 use super::variable_symbol::VariableSymbol;
 use super::xml_file_symbol::XmlFileSymbol;
 
+/// The main symbol enum representing all code entities in the symbol tree.
+///
+/// # Symbol Hierarchy
+///
+/// ```text
+/// Root
+/// ├── DiskDir (unparsed directory)
+/// ├── Namespace (Python namespace package)
+/// └── Package (Python package or Odoo module)
+///     ├── File (Python .py file)
+///     │   ├── Class
+///     │   │   ├── Function (method)
+///     │   │   └── Variable (field)
+///     │   ├── Function
+///     │   └── Variable
+///     └── Package (nested)
+/// ```
+///
+/// # Ownership Pattern
+///
+/// Symbols use `Rc<RefCell<Symbol>>` for shared ownership with interior mutability.
+/// Parent references are `Weak<RefCell<Symbol>>` to prevent reference cycles.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Create a file symbol
+/// let file = Rc::new(RefCell::new(Symbol::File(FileSymbol::new(...))));
+/// file.borrow_mut().set_weak_self(Rc::downgrade(&file));
+/// file.borrow_mut().set_parent(Some(parent_weak));
+/// ```
+///
+/// See the [Python Core Onboarding Guide](../../docs/python-core-onboarding.md) for details.
 #[derive(Debug)]
 pub enum Symbol {
     Root(RootSymbol),
@@ -55,18 +88,61 @@ pub enum Symbol {
 }
 
 impl Symbol {
-    /// Checks if weak references of symbol are equal
-    /// Attempts to upgrade both (false upon failure) and does pointer equality
+    /// Checks if two weak references point to the same symbol.
+    ///
+    /// # Arguments
+    ///
+    /// * `me` - First weak reference to compare
+    /// * `them` - Second weak reference to compare
+    ///
+    /// # Returns
+    ///
+    /// `true` if both weak references can be upgraded and point to the same `Rc`,
+    /// `false` if either fails to upgrade or they point to different symbols.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let weak1 = symbol.borrow().weak_self().unwrap();
+    /// let weak2 = symbol.borrow().weak_self().unwrap();
+    /// assert!(Symbol::weak_ptr_eq(&weak1, &weak2));
+    /// ```
     pub fn weak_ptr_eq(me: &Weak<RefCell<Symbol>>, them: &Weak<RefCell<Symbol>>) -> bool{
         me.upgrade().and_then(|me_rc| them.upgrade().map(|them_rc| Rc::ptr_eq(&me_rc, &them_rc))).unwrap_or(false)
     }
+    
+    /// Creates a new root symbol for an entry point.
+    ///
+    /// The root symbol is the top-level container in a symbol tree. Each entry point
+    /// (ODOO, ADDON, BUILTIN, etc.) has its own root symbol.
+    ///
+    /// # Returns
+    ///
+    /// A new root symbol wrapped in `Rc<RefCell<_>>` with its weak self-reference initialized.
     pub fn new_root() -> Rc<RefCell<Self>> {
         let root = Rc::new(RefCell::new(Symbol::Root(RootSymbol::new())));
         root.borrow_mut().set_weak_self(Rc::downgrade(&root));
         root
     }
 
-    //Create a sub-symbol that is representing a file
+    /// Creates a new file symbol as a child of this symbol.
+    ///
+    /// File symbols represent Python source files (.py) in the symbol tree.
+    /// Can only be called on Root, Namespace, Package, or DiskDir symbols.
+    ///
+    /// # Arguments
+    ///
+    /// * `_session` - Current session info (unused)
+    /// * `name` - File name (e.g., "models")
+    /// * `path` - Full filesystem path to the file
+    ///
+    /// # Returns
+    ///
+    /// The newly created file symbol with parent and weak_self initialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on an invalid symbol type (e.g., Class, Function).
     pub fn add_new_file(&mut self, _session: &mut SessionInfo, name: &String, path: &String) -> Rc<RefCell<Self>> {
         let file = Rc::new(RefCell::new(Symbol::File(FileSymbol::new(name.clone(), path.clone(), self.is_external()))));
         file.borrow_mut().set_weak_self(Rc::downgrade(&file));

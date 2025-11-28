@@ -29,27 +29,67 @@ pub struct Argument {
     pub annotation: Option<Box<Expr>>,
 }
 
+/// Represents a Python function or method in the symbol tree.
+///
+/// # Build Status
+///
+/// Unlike file symbols, functions have their own independent build status for each phase.
+/// This allows building individual functions without rebuilding the entire file.
+///
+/// # Return Type Tracking
+///
+/// The `evaluations` field stores inferred return types. Can be multiple evaluations for
+/// functions with different return paths (e.g., `return "str" if x else 5` → [str, int]).
+///
+/// # Decorator Flags
+///
+/// - `is_static`: `@staticmethod`
+/// - `is_property`: `@property`
+/// - `is_class_method`: `@classmethod`
+/// - `is_overloaded`: `@overload` (typing hint only)
+///
+/// # Symbol Storage
+///
+/// Implements `SymbolMgr` trait for managing local variables and nested functions with
+/// section-based visibility for control flow.
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#functionsymbol) for details.
 #[derive(Debug)]
 pub struct FunctionSymbol {
     pub name: OYarn,
     pub is_external: bool,
+    
+    /// Decorator flags
     pub is_static: bool,
     pub is_property: bool,
     pub doc_string: Option<String>,
+    
+    /// Link to AST node for this function
     pub node_index: AtomicNodeIndex,
-    pub diagnostics: HashMap<BuildSteps, Vec<Diagnostic>>, //only temporary used for CLASS and FUNCTION to be collected like others are stored on FileInfo
-    pub evaluations: Vec<Evaluation>, //Vec, because sometimes a single allocation can be ambiguous, like ''' a = "5" if X else 5 '''
+    /// Diagnostics specific to this function (collected separately from file diagnostics)
+    pub diagnostics: HashMap<BuildSteps, Vec<Diagnostic>>,
+    /// Inferred return types (can be multiple for ambiguous returns)
+    pub evaluations: Vec<Evaluation>,
     pub model_dependencies: PtrWeakHashSet<Weak<RefCell<Model>>>,
     pub weak_self: Option<Weak<RefCell<Symbol>>>,
     pub parent: Option<Weak<RefCell<Symbol>>>,
+    
+    /// Function-level build status (independent from file)
     pub arch_status: BuildStatus,
     pub arch_eval_status: BuildStatus,
     pub validation_status: BuildStatus,
+    
+    /// Full function range including `def` line
     pub range: TextRange,
+    /// Body range (excludes `def name(args):` line)
     pub body_range: TextRange,
+    /// Function parameters with types and defaults
     pub args: Vec<Argument>,
-    pub is_overloaded: bool, //used for @overload decorator. Only indicates if the decorator is present. Use is_overloaded() to know if this function is overloaded
-    pub is_class_method: bool, //used for @classmethod decorator
+    
+    /// True if `@overload` decorator is present (typing hint)
+    pub is_overloaded: bool,
+    /// True if `@classmethod` decorator is present
+    pub is_class_method: bool,
     pub noqas: NoqaInfo,
 
     //Trait SymbolMgr

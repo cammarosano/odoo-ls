@@ -5,6 +5,30 @@ use std::{cell::RefCell, collections::HashMap, rc::{Rc, Weak}};
 
 use super::{symbol::Symbol, symbol_mgr::{SectionRange, SymbolMgr}};
 
+/// Represents a Python source file in the symbol tree.
+///
+/// # Build Status Tracking
+///
+/// Each file tracks its build status independently for each phase:
+/// - `arch_status`: ARCH phase (symbol tree building)
+/// - `arch_eval_status`: ARCH_EVAL phase (type evaluation)
+/// - `validation_status`: VALIDATION phase (diagnostics)
+///
+/// # Dependency Tracking
+///
+/// Dependencies are stored in a 2D structure: `dependencies[step][level]`
+/// - `step`: The build step that needs the dependency (ARCH=0, ARCH_EVAL=1, VALIDATION=2)
+/// - `level`: The build level required from the dependency (ARCH=0, ARCH_EVAL=1)
+///
+/// Example: If this file's ARCH_EVAL needs another file's ARCH to be done:
+/// `dependencies[1][0]` contains a weak reference to that file.
+///
+/// # Symbol Storage
+///
+/// Implements the `SymbolMgr` trait for managing symbols (classes, functions, variables)
+/// defined within this file using section-based visibility for control flow.
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#filesymbol) for details.
 #[derive(Debug)]
 pub struct FileSymbol {
     pub name: OYarn,
@@ -12,23 +36,37 @@ pub struct FileSymbol {
     pub is_external: bool,
     pub weak_self: Option<Weak<RefCell<Symbol>>>,
     pub parent: Option<Weak<RefCell<Symbol>>>,
+    
+    /// Build status for ARCH phase (symbol tree building)
     pub arch_status: BuildStatus,
+    /// Build status for ARCH_EVAL phase (type evaluation)
     pub arch_eval_status: BuildStatus,
+    /// Build status for VALIDATION phase (diagnostics generation)
     pub validation_status: BuildStatus,
+    
+    /// Import paths that couldn't be resolved (will retry after dependencies built)
     pub not_found_paths: Vec<(BuildSteps, Vec<OYarn>)>,
+    /// Odoo models referenced but not found yet
     pub not_found_models: HashMap<OYarn, BuildSteps>,
-    pub xml_ids: HashMap<OYarn, Vec<OdooData>>, //used for dynamic XML_ID records, like ir.models
+    /// Dynamic XML IDs created by this file (e.g., ir.model records)
+    pub xml_ids: HashMap<OYarn, Vec<OdooData>>,
     in_workspace: bool,
     pub self_import: bool,
-    pub model_dependencies: PtrWeakHashSet<Weak<RefCell<Model>>>, //always on validation level, as odoo step is always required
+    /// Odoo models this file depends on (for invalidation)
+    pub model_dependencies: PtrWeakHashSet<Weak<RefCell<Model>>>,
+    
+    /// Dependencies: `[step][level] -> Set<Symbol>`. This file needs those symbols.
     pub dependencies: Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>>,
+    /// Dependents: `[level][step] -> Set<Symbol>`. Those symbols need this file.
     pub dependents: Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>>,
+    
+    /// Hash of processed file content (for change detection)
     pub processed_text_hash: u64,
     pub noqas: NoqaInfo,
 
     //Trait SymbolMgr
     pub sections: Vec<SectionRange>,
-    pub symbols: HashMap<OYarn, HashMap<u32, Vec<Rc<RefCell<Symbol>>>>>,
+    pub symbols: HashMap<OYarn, HashMap<u32, Vec<Rc<RefCell<Symbol>>>>>, // doc-todo: why inner hashmap with u32? Is it section-based storage?
     //--- dynamics variables
     pub ext_symbols: HashMap<OYarn, PtrWeakHashSet<Weak<RefCell<Symbol>>>>,
     pub decl_ext_symbols: PtrWeakKeyHashMap<Weak<RefCell<Symbol>>, HashMap<OYarn, HashMap<u32, Vec<Rc<RefCell<Symbol>>>>>>

@@ -16,10 +16,48 @@ use crate::threads::SessionInfo;
 use super::symbols::module_symbol::ModuleSymbol;
 use super::symbols::symbol::Symbol;
 
+/// Metadata for an Odoo model attached to a `ClassSymbol`.
+///
+/// # Purpose
+///
+/// Stores Odoo-specific attributes extracted from the class definition:
+/// - `_name`: Model identifier
+/// - `_inherit`: Models to extend
+/// - `_inherits`: Delegation inheritance
+/// - Field definitions and computed field tracking
+///
+/// # Inheritance Patterns
+///
+/// ## `_name`: Define New Model
+/// ```python
+/// class Partner(models.Model):
+///     _name = 'res.partner'
+///     name = fields.Char()
+/// ```
+///
+/// ## `_inherit`: Extend Existing Model(s)
+/// ```python
+/// class Partner(models.Model):
+///     _inherit = 'res.partner'  # or ['res.partner', 'mail.thread']
+///     new_field = fields.Char()
+/// ```
+///
+/// ## `_inherits`: Delegation Inheritance
+/// ```python
+/// class User(models.Model):
+///     _name = 'res.users'
+///     _inherits = {'res.partner': 'partner_id'}
+///     partner_id = fields.Many2one('res.partner', required=True)
+/// ```
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#model-inheritance-patterns) for details.
 #[derive(Debug)]
 pub struct ModelData {
+    /// Model's `_name` attribute (e.g., "res.partner")
     pub name: OYarn,
+    /// List of models to inherit from (`_inherit`)
     pub inherit: Vec<OYarn>,
+    /// Delegation inheritance: (model_name, field_name)
     pub inherits: Vec<(OYarn, OYarn)>,
 
     pub description: String,
@@ -69,10 +107,46 @@ impl ModelData {
     }
 }
 
+/// Aggregates all class symbols that define or extend the same Odoo model.
+///
+/// # Purpose
+///
+/// A single Odoo model (identified by `_name`) can be defined and extended across
+/// multiple Python files and modules. This struct collects all those class symbols.
+///
+/// # Example
+///
+/// ```python
+/// # In base module:
+/// class Partner(models.Model):
+///     _name = 'res.partner'
+///     name = fields.Char()
+///
+/// # In sale module:
+/// class Partner(models.Model):
+///     _inherit = 'res.partner'
+///     sale_count = fields.Integer()
+///
+/// # In account module:
+/// class Partner(models.Model):
+///     _inherit = 'res.partner'
+///     credit_limit = fields.Float()
+/// ```
+///
+/// All three class symbols belong to the same `Model` with `name = "res.partner"`.
+///
+/// # Storage
+///
+/// Stored in `SyncOdoo.models: HashMap<OYarn, Rc<RefCell<Model>>>` keyed by model name.
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#model-aggregation) for details.
 #[derive(Debug)]
 pub struct Model {
+    /// Model name (e.g., "res.partner")
     name: OYarn,
+    /// All class symbols that define/extend this model
     symbols: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
+    /// Files that depend on this model (for invalidation)
     pub dependents: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
 }
 
@@ -87,6 +161,19 @@ impl Model {
         res
     }
 
+    /// Adds a class symbol to this model's collection.
+    ///
+    /// When a new class extends or defines this model, it's added to the `symbols` set.
+    /// All dependents are then invalidated (marked for revalidation) since the model changed.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session info
+    /// * `symbol` - Class symbol to add
+    ///
+    /// # Side Effects
+    ///
+    /// Invalidates all files that depend on this model (triggers VALIDATION rebuild).
     pub fn add_symbol(&mut self, session: &mut SessionInfo, symbol: Rc<RefCell<Symbol>>) {
         if self.symbols.contains(&symbol) {
             return;
@@ -101,6 +188,17 @@ impl Model {
         self.add_dependents_to_validation(session, from_module);
     }
 
+    /// Retrieves all class symbols for this model visible from a given module.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session info
+    /// * `from_module` - Context module (only returns symbols in dependencies)
+    ///
+    /// # Returns
+    ///
+    /// All class symbols (main definitions and extensions) visible from `from_module`.
+    /// If `from_module` is `None`, returns all symbols regardless of dependencies.
     pub fn get_symbols(&self, session: &mut SessionInfo, from_module: Option<Rc<RefCell<Symbol>>>) -> Vec<Rc<RefCell<Symbol>>> {
         let mut symbol = Vec::new();
         for s in self.symbols.iter() {
@@ -112,6 +210,29 @@ impl Model {
         symbol
     }
 
+    /// Retrieves only the main class symbols for this model (excludes extensions).
+    ///
+    /// Main symbols are classes where `_name` != `_inherit` (i.e., they define the model
+    /// rather than just extending it).
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session info
+    /// * `from_module` - Context module (only returns symbols in dependencies)
+    ///
+    /// # Returns
+    ///
+    /// Main class symbols visible from `from_module`.
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// class Partner(models.Model):
+    ///     _name = 'res.partner'        # Main symbol
+    ///
+    /// class Partner(models.Model):
+    ///     _inherit = 'res.partner'     # Extension symbol (excluded)
+    /// ```
     pub fn get_main_symbols(&self, session: &mut SessionInfo, from_module: Option<Rc<RefCell<Symbol>>>) -> Vec<Rc<RefCell<Symbol>>> {
         let mut res: Vec<Rc<RefCell<Symbol>>> = vec![];
         for sym in self.symbols.iter() {

@@ -13,19 +13,50 @@ use super::symbol::Symbol;
 use super::symbol_mgr::{SectionRange, SymbolMgr};
 
 
+/// Represents a Python class in the symbol tree.
+///
+/// # Odoo Models
+///
+/// If the class inherits from `models.Model`, it may have `ModelData` attached in the `_model` field.
+/// This contains Odoo-specific metadata like `_name`, `_inherit`, fields, etc.
+///
+/// Multiple `ClassSymbol`s with the same `_name` are aggregated into a single `Model` in
+/// `SyncOdoo.models` registry.
+///
+/// # Body Range
+///
+/// - `range`: Full class definition including `class Name(bases):`
+/// - `body_range`: Only the class body (excludes the definition line)
+///
+/// This distinction is important for determining which symbols are visible inside vs outside the class.
+///
+/// # Symbol Storage
+///
+/// Implements `SymbolMgr` trait for managing methods and class variables with section-based visibility.
+///
+/// See [Python Core Onboarding Guide](../../docs/python-core-onboarding.md#classsymbol) for details.
 #[derive(Debug)]
 pub struct ClassSymbol {
     pub name: OYarn,
     pub is_external: bool,
     pub doc_string: Option<String>,
+    
+    /// Base classes (weak references to avoid cycles)
     pub bases: Vec<Weak<RefCell<Symbol>>>,
     pub weak_self: Option<Weak<RefCell<Symbol>>>,
     pub parent: Option<Weak<RefCell<Symbol>>>,
+    
+    /// Full range including class definition line
     pub range: TextRange,
+    /// Body range (excludes `class Name(bases):` line)
     pub body_range: TextRange,
+    
+    /// Odoo model metadata if this class is an Odoo model
     pub _model: Option<ModelData>,
     pub noqas: NoqaInfo,
-    pub(crate) _is_field_class: Rc<RefCell<Option<bool>>>, //cache, do not call directly, use is_field_class() method instead
+    
+    /// Cached field class check (do not access directly, use `is_field_class()` method)
+    pub(crate) _is_field_class: Rc<RefCell<Option<bool>>>,
 
     //Trait SymbolMgr
     //--- Body symbols
@@ -60,6 +91,26 @@ impl ClassSymbol {
         res
     }
 
+    /// Checks if this class inherits from the given base class (recursively).
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - The base class to check for
+    /// * `checked` - Set of already checked classes (to avoid infinite loops)
+    ///
+    /// # Returns
+    ///
+    /// `true` if this class inherits from `base` (directly or transitively), `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// class A: pass
+    /// class B(A): pass
+    /// class C(B): pass
+    /// # C.inherits(A) -> true (transitive)
+    /// # C.inherits(B) -> true (direct)
+    /// ```
     pub fn inherits(&self, base: &Rc<RefCell<Symbol>>, checked: &mut Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>) -> bool {
         if checked.is_none() {
             *checked = Some(PtrWeakHashSet::new());
