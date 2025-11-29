@@ -1607,6 +1607,10 @@ fn test_symbol_lookup() {
 - `FileMgr` - File content and AST cache
 - `FileInfo` - Per-file information
 
+### Related Documentation
+
+- **[Build & Rebuild Lifecycle](./build-rebuild-lifecycle.md)** - Comprehensive deep-dive into the build pipeline, covering server startup, LSP initialization, dependency tracking, partial rebuilds, and the debounce/interrupt mechanisms. Essential reading for understanding how file changes trigger rebuilds.
+
 ### Further Reading
 
 - **LSP Specification**: https://microsoft.github.io/language-server-protocol/
