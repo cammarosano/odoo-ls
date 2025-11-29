@@ -613,6 +613,54 @@ impl SyncOdoo {
         return self.entry_point_mgr.borrow().main_entry_point.as_ref().expect("Unable to find main entry point").clone()
     }
 
+    /// Selects and removes the next symbol to process from a rebuild queue.
+    ///
+    /// # Purpose
+    ///
+    /// This function implements a **dependency-aware scheduling algorithm** for the build pipeline.
+    /// Rather than processing symbols in arbitrary order, it selects the symbol with the fewest
+    /// unresolved dependencies, ensuring that dependencies are processed before dependents when possible.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. **Selection Phase** (immutable borrow):
+    ///    - Iterates through all symbols in the specified rebuild queue
+    ///    - For each symbol, counts how many of its dependencies are still pending in any queue
+    ///    - Selects the symbol with the lowest dependency count
+    ///    - Early exits if a symbol with zero dependencies is found (optimal choice)
+    ///
+    /// 2. **Removal Phase** (mutable borrow):
+    ///    - Removes the selected symbol from the queue
+    ///    - If no symbol was selected, clears the queue (removes dead weak references)
+    ///
+    /// # Arguments
+    ///
+    /// * `step` - The build phase to pop from:
+    ///   - `BuildSteps::ARCH` → `rebuild_arch` queue
+    ///   - `BuildSteps::ARCH_EVAL` → `rebuild_arch_eval` queue
+    ///   - `BuildSteps::VALIDATION` → `rebuild_validation` queue
+    ///
+    /// # Returns
+    ///
+    /// - `Some(symbol)` - The next symbol to process, removed from the queue
+    /// - `None` - Queue is empty (or only contained dead weak references)
+    ///
+    /// # Usage in `process_rebuilds`
+    ///
+    /// Called repeatedly by `process_rebuilds` to drain each queue in order:
+    /// ```rust,ignore
+    /// while !queues_empty {
+    ///     if let Some(sym) = sync_odoo.pop_item(BuildSteps::ARCH) { /* process */ }
+    ///     if let Some(sym) = sync_odoo.pop_item(BuildSteps::ARCH_EVAL) { /* process */ }
+    ///     if let Some(sym) = sync_odoo.pop_item(BuildSteps::VALIDATION) { /* process */ }
+    /// }
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// The two-phase approach (selection then removal) is required because Rust's borrow checker
+    /// doesn't allow mutable access while iterating. The selection phase uses an immutable borrow
+    /// to find the best candidate, then a separate mutable borrow removes it.
     fn pop_item(&mut self, step: BuildSteps) -> Option<Rc<RefCell<Symbol>>> {
         let mut arc_sym: Option<Rc<RefCell<Symbol>>> = None;
         //Part 1: Find the symbol with a unmutable set
