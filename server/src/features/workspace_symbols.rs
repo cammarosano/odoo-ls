@@ -6,6 +6,27 @@ use ruff_text_size::{TextRange, TextSize};
 
 use crate::{S, constants::{PackageType, SymType}, core::{entry_point::EntryPointType, file_mgr::FileMgr, symbols::symbol::Symbol}, threads::SessionInfo, utils::string_fuzzy_contains};
 
+/// Provides workspace-wide symbol search (Ctrl+T / Cmd+T).
+///
+/// Searches across all loaded entry points (excluding builtins) for symbols
+/// matching a query string using fuzzy matching.
+///
+/// # Search Features
+///
+/// * **Symbol names**: Direct fuzzy match on function, class, variable names
+/// * **Model names**: Prefix with `"` to search Odoo model names (e.g., `"sale.order`)
+/// * **XML IDs**: Prefix with `xmlid.` to search XML record IDs
+///
+/// # Lazy Resolution
+///
+/// For performance, symbol locations can be resolved lazily:
+/// 1. Initial response: `WorkspaceLocation` with URI only, range in `data` field
+/// 2. On resolve: Convert to full `Location` with proper line/column range
+///
+/// # Cancellation
+///
+/// Long-running searches check `is_request_cancelled()` at file boundaries
+/// to support cancellation of expensive operations.
 pub struct WorkspaceSymbolFeature;
 
 impl WorkspaceSymbolFeature {

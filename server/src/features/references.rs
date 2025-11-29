@@ -5,7 +5,17 @@ use lsp_types::{Location, Range};
 use crate::{constants::SymType, core::{file_mgr::{FileInfo, FileMgr}, symbols::symbol::Symbol}, features::xml_ast_utils::{XmlAstResult, XmlAstUtils}, threads::SessionInfo, utils::PathSanitizer};
 
 
-
+/// Provides find-references functionality.
+///
+/// Currently only implemented for XML files. Python references are planned
+/// but not yet implemented.
+///
+/// # Status
+/// | File Type | Implementation |
+/// |-----------|----------------|
+/// | Python | Not implemented (returns `None`) |
+/// | XML | Implemented via `XmlAstUtils` |
+/// | CSV | Not implemented (returns `None`) |
 pub struct ReferenceFeature {
 
 }

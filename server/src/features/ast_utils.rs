@@ -15,11 +15,43 @@ use ruff_python_ast::{Alias, AtomicNodeIndex, ExceptHandler, Expr, ExprCall, Ide
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use tracing::warn;
 
+/// Utilities for finding and analyzing AST nodes at cursor positions.
+///
+/// This struct provides the core symbol-finding functionality used by LSP features
+/// like hover, definition, and completion. It bridges the gap between cursor positions
+/// (byte offsets) and the semantic symbol information stored in the symbol tree.
+///
+/// # Key Responsibilities
+/// - Finding the AST expression at a given cursor offset
+/// - Evaluating expressions to determine their types/symbols
+/// - Special handling for import statements (which don't have symbols in the file tree)
+/// - Ensuring scopes are built before analysis (lazy building)
 pub struct AstUtils {}
 
 impl AstUtils {
-
-
+    /// Finds symbols at a given cursor position within a Python file.
+    ///
+    /// This is the main entry point for symbol resolution used by hover, definition,
+    /// and other features. It traverses the AST to find the expression at the cursor
+    /// position and evaluates it to determine its type information.
+    ///
+    /// # Arguments
+    /// * `session` - The current session containing server state
+    /// * `file_info_ast` - The parsed AST of the file
+    /// * `file_symbol` - The symbol representing the file in the symbol tree
+    /// * `offset` - The byte offset of the cursor position
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// * `AnalyzeAstResult` - Evaluations (symbol types) and diagnostics
+    /// * `Option<TextRange>` - The range of the found expression
+    /// * `Option<ExprOrIdent>` - The AST node at the position (expression or identifier)
+    /// * `Option<ExprCall>` - The enclosing call expression (if any, used for context)
+    ///
+    /// # Special Cases
+    /// - Import statements are handled separately via `get_symbol_in_import` because
+    ///   imported symbols aren't directly visible in the file's symbol tree
+    /// - Returns default/empty results if no expression is found at the offset
     pub fn get_symbols<'a>(session: &mut SessionInfo, file_info_ast: &'a FileInfoAst, file_symbol: &Rc<RefCell<Symbol>>, offset: u32) -> (AnalyzeAstResult, Option<TextRange>, Option<ExprOrIdent<'a>>, Option<ExprCall>) {
         let mut expr: Option<ExprOrIdent<'a>> = None;
         let mut call_expr: Option<ExprCall> = None;
@@ -41,6 +73,26 @@ impl AstUtils {
         (result, range, Some(expr), call_expr)
     }
 
+    /// Evaluates an expression to determine its type and symbol information.
+    ///
+    /// This function takes an already-found AST expression and performs type evaluation
+    /// on it. It first ensures the enclosing scope is built (triggering lazy building if
+    /// needed), then invokes the evaluation system.
+    ///
+    /// # Arguments
+    /// * `session` - The current session containing server state
+    /// * `file_symbol` - The symbol representing the file in the symbol tree
+    /// * `expr` - The AST expression or identifier to evaluate
+    /// * `offset` - The byte offset (used to find the enclosing scope)
+    ///
+    /// # Returns
+    /// * `AnalyzeAstResult` - Contains evaluations with type information
+    /// * `Option<TextRange>` - The range of the expression
+    ///
+    /// # Context
+    /// The evaluation is performed with a context containing:
+    /// * `module` - The containing module (for dependency resolution)
+    /// * `range` - The expression range (used by some evaluators)
     pub fn get_symbol_from_expr<'a>(session: &mut SessionInfo, file_symbol: &Rc<RefCell<Symbol>>, expr: &ExprOrIdent<'a>, offset: u32) -> (AnalyzeAstResult, Option<TextRange>) {
         let parent_symbol = Symbol::get_scope_symbol(file_symbol.clone(), offset, matches!(expr, ExprOrIdent::Parameter(_)));
         AstUtils::build_scope(session, &parent_symbol);
@@ -58,6 +110,18 @@ impl AstUtils {
         (analyse_ast_result, Some(expr.range()))
     }
 
+    /// Converts an expression AST node to its dotted string representation.
+    ///
+    /// This is useful for displaying attribute access chains like `self.partner_id.name`
+    /// as a single string.
+    ///
+    /// # Examples
+    /// * `Name("self")` → `"self"`
+    /// * `Attribute(Name("self"), "partner_id")` → `"selfpartner_id"` (note: no dot separator)
+    ///
+    /// # Note
+    /// The current implementation doesn't add dot separators between components.
+    /// Only handles `Name` and `Attribute` expressions; others return `"//Unhandled//"`.
     pub fn flatten_expr(expr: &Expr) -> String {
         match expr {
             Expr::Name(n) => {
@@ -70,6 +134,24 @@ impl AstUtils {
         }
     }
 
+    /// Ensures a scope symbol is fully built before analysis.
+    ///
+    /// This implements lazy building of function bodies. When a feature needs to
+    /// analyze an expression within a function, the function's symbols may not yet
+    /// be built (they're built lazily for performance). This function triggers the
+    /// build if needed.
+    ///
+    /// # Build Phases Triggered
+    /// * `ARCH` - Parses the function body and creates child symbols
+    /// * `ARCH_EVAL` - Evaluates types for the function's symbols
+    ///
+    /// # Scope Resolution
+    /// For nested functions, this finds the outermost parent function that needs
+    /// building, since building an outer function also builds inner ones.
+    ///
+    /// # Arguments
+    /// * `session` - The current session
+    /// * `scope` - The scope symbol (typically a function) to build
     pub fn build_scope(session: &mut SessionInfo<'_>, scope: &Rc<RefCell<Symbol>>) {
         if scope.borrow().typ() == SymType::FUNCTION {
             let parent_func = scope.borrow().get_in_parents(&vec![SymType::FUNCTION], true);
@@ -84,10 +166,36 @@ impl AstUtils {
         }
     }
 
+    /// Resolves symbols within import statements.
+    ///
+    /// Import statements require special handling because the imported symbols aren't
+    /// directly visible in the file's symbol tree. This function handles both:
+    /// * `import X.Y.Z` statements
+    /// * `from X.Y import Z` statements
+    ///
+    /// # Import Resolution Strategy
+    ///
+    /// For `import a.b.c`:
+    /// - If cursor is on an intermediate part (e.g., `b`), resolve the partial path `a.b`
+    ///   as a module using `resolve_from_stmt`
+    /// - If cursor is on the last part or the alias, use `resolve_import_stmt` to get
+    ///   the fully resolved symbol
+    ///
+    /// For `from a.b import c`:
+    /// - Only handles the module part (`a.b`); the imported name `c` is handled by
+    ///   normal AST walking since it becomes visible in the file's namespace
+    ///
+    /// # Arguments
+    /// * `session` - The current session
+    /// * `file_symbol` - The file symbol for context
+    /// * `offset` - Cursor position
+    /// * `stmt` - The statement to check (only Import/ImportFrom are handled)
+    ///
+    /// # Returns
+    /// * `Some((result, range))` - If cursor is on an import and symbol was resolved
+    /// * `None` - If not an import statement or cursor not on resolvable part
     fn get_symbol_in_import(session: &mut SessionInfo, file_symbol: &Rc<RefCell<Symbol>>, offset: u32, stmt: &Stmt) -> Option<(AnalyzeAstResult, Option<TextRange>)> {
         match stmt {
-            //for all imports, the idea will be to check if we are on the last name of the import (then it has been imported already and we can fallback on it),
-            //or then take the full tree to the offset symbol and resolve_import on it as it was in a 'from' clause.
             Stmt::Import(stmt) => {
                 for alias in stmt.names.iter() {
                     if alias.range().contains(TextSize::new(offset)) {
@@ -180,6 +288,37 @@ impl AstUtils {
 }
 
 
+/// A visitor that finds the AST expression at a specific cursor offset.
+///
+/// This visitor traverses the AST tree and identifies:
+/// 1. The innermost expression containing the cursor position
+/// 2. The last call expression before the cursor (useful for completion context)
+///
+/// # How It Works
+///
+/// The visitor walks the AST depth-first. For each node:
+/// - If the node's range contains the offset, it descends into children
+/// - After visiting children, if no child claimed the expression, this node becomes it
+/// - For call expressions, it tracks whether the cursor is within the arguments
+///
+/// # Special Node Handling
+///
+/// Several node types need special handling because they contain identifiers that
+/// aren't represented as `Expr::Name`:
+/// - **Alias** (imports): `import foo as bar` - handles both `foo` and `bar`
+/// - **ExceptHandler**: `except E as e:` - handles the bound name `e`
+/// - **Parameter**: Function parameters
+/// - **Keyword**: Keyword arguments in calls
+/// - **PatternKeyword**: Pattern matching keywords
+/// - **TypeParam**: Generic type parameters
+/// - **Pattern**: Match patterns (MatchMapping, MatchStar, MatchAs)
+/// - **FunctionDef/ClassDef**: The defined name
+/// - **Global/Nonlocal**: The listed names
+///
+/// # Fields
+/// * `offset` - The target cursor position (byte offset)
+/// * `expr` - The found expression or identifier (set during traversal)
+/// * `last_call_expr` - The last call expression containing the cursor in its arguments
 pub struct ExprFinderVisitor<'a> {
     offset: TextSize,
     expr: Option<ExprOrIdent<'a>>,
@@ -187,12 +326,21 @@ pub struct ExprFinderVisitor<'a> {
 }
 
 impl<'a> ExprFinderVisitor<'a> {
-    /*
-    Find expr from `stmt` at the given `offset`
-    Returns: (expr, last_call_expr)
-        expr: the expr being searched for
-        last_call_expr: The last call expr preceding the expr we are searching for
-     */
+    /// Finds the expression at a given offset within a statement.
+    ///
+    /// This is the main entry point for expression finding. It creates a visitor,
+    /// walks the statement tree, and returns the results.
+    ///
+    /// # Arguments
+    /// * `stmt` - The statement to search within
+    /// * `offset` - The byte offset of the cursor position
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// * `Option<ExprOrIdent>` - The expression/identifier at the offset, if found
+    /// * `Option<ExprCall>` - The enclosing call expression (cloned), if the cursor
+    ///   is within a function call's arguments. This is used by completion to provide
+    ///   parameter-aware suggestions.
     pub fn find_expr_at(stmt: &'a Stmt, offset: u32) -> (Option<ExprOrIdent<'a>>, Option<ExprCall>) {
         let mut visitor = Self {
             offset: TextSize::new(offset),

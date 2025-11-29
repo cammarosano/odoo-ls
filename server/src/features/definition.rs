@@ -17,10 +17,38 @@ use crate::{S, oyarn};
 use crate::threads::SessionInfo;
 use crate::utils::PathSanitizer as _;
 
+/// Provides go-to-definition functionality for Python and XML files.
+///
+/// This feature handles the `textDocument/definition` LSP request, navigating users
+/// to the definition of symbols under their cursor. It includes special handling for
+/// Odoo-specific patterns like model names, domain fields, and XML IDs.
+///
+/// # Special String Handling
+///
+/// Unlike typical go-to-definition which just follows symbol references, this
+/// implementation recognizes several Odoo-specific string patterns:
+///
+/// * **Domain fields**: `[('partner_id', '=', ...)]` - navigates to field definition
+/// * **Model names**: `self.env['res.partner']` - navigates to model class
+/// * **Module dependencies**: `'depends': ['sale']` - navigates to module manifest
+/// * **XML IDs**: `self.env.ref('sale.view_order_form')` - navigates to XML record
+/// * **Compute methods**: `compute='_compute_total'` - navigates to method
 pub struct DefinitionFeature {}
 
 impl DefinitionFeature {
-
+    /// Checks if the cursor is on a domain field string and resolves it.
+    ///
+    /// Domain fields are strings in search domain expressions like:
+    /// ```python
+    /// self.search([('partner_id', '=', partner.id)])
+    /// #            ^^^^^^^^^^
+    /// ```
+    ///
+    /// Uses `FeaturesUtils::find_argument_symbols` to resolve the field name
+    /// to actual field definitions on the model being searched.
+    ///
+    /// # Returns
+    /// `true` if this was a domain field and definitions were found.
     fn check_for_domain_field(session: &mut SessionInfo, eval: &Evaluation, file_symbol: &Rc<RefCell<Symbol>>, call_expr: &Option<ExprCall>, offset: usize, links: &mut Vec<LocationLink>) -> bool {
         let (field_name, field_range) = if let Some(eval_value) = eval.value.as_ref() {
             if let EvaluationValue::CONSTANT(Expr::StringLiteral(expr)) = eval_value {
@@ -51,6 +79,22 @@ impl DefinitionFeature {
         string_domain_fields.len() > 0
     }
 
+    /// Checks if the cursor is on a model name string and resolves it.
+    ///
+    /// Model name strings appear in contexts like:
+    /// ```python
+    /// self.env['res.partner']  # navigates to res.partner model class
+    /// _inherit = 'sale.order'  # navigates to sale.order model class
+    /// ```
+    ///
+    /// # Behavior
+    /// - Looks up the model in `session.sync_odoo.models`
+    /// - Returns all class symbols that implement the model
+    /// - Filters based on module dependencies (shows classes accessible from current module)
+    /// - Skips the current class if cursor is already on it (unless it's the only result)
+    ///
+    /// # Returns
+    /// `true` if this was a model name and definitions were found.
     fn check_for_model_string(session: &mut SessionInfo, eval: &Evaluation, file_symbol: &Rc<RefCell<Symbol>>, links: &mut Vec<LocationLink>) -> bool {
         let value = if let Some(eval_value) = eval.value.as_ref() {
             if let EvaluationValue::CONSTANT(Expr::StringLiteral(expr)) = eval_value {
@@ -91,6 +135,20 @@ impl DefinitionFeature {
         model_found
     }
 
+    /// Checks if the cursor is on a module dependency string in `__manifest__.py`.
+    ///
+    /// In Odoo module manifests, the `depends` list contains module names:
+    /// ```python
+    /// # In __manifest__.py
+    /// 'depends': ['sale', 'stock']  # navigates to those modules' manifests
+    /// ```
+    ///
+    /// # Conditions
+    /// - Only active in `__manifest__.py` files
+    /// - Only for files in MODULE packages
+    ///
+    /// # Returns
+    /// `true` if this was a module dependency and the module was found.
     fn check_for_module_string(session: &mut SessionInfo, eval: &Evaluation, file_symbol: &Rc<RefCell<Symbol>>, file_path: &String, links: &mut Vec<LocationLink>) -> bool {
         if file_symbol.borrow().typ() != SymType::PACKAGE(PackageType::MODULE) || !file_path.ends_with("__manifest__.py") {
             // If not on manifest, we don't check for modules
@@ -118,6 +176,19 @@ impl DefinitionFeature {
         true
     }
 
+    /// Checks if the cursor is on an XML ID reference string.
+    ///
+    /// XML IDs reference records defined in XML data files:
+    /// ```python
+    /// self.env.ref('sale.view_order_form')  # navigates to XML record
+    /// ```
+    ///
+    /// # XML ID Resolution
+    /// Uses `SyncOdoo::get_xml_ids` to find matching records across all
+    /// loaded modules. The XML ID format is `module.record_id`.
+    ///
+    /// # Returns
+    /// `true` if this was an XML ID and records were found.
     fn check_for_xml_id_string(session: &mut SessionInfo, eval: &Evaluation, file_symbol: &Rc<RefCell<Symbol>>, links: &mut Vec<LocationLink>) -> bool {
         let value = if let Some(eval_value) = eval.value.as_ref() {
             if let EvaluationValue::CONSTANT(Expr::StringLiteral(expr)) = eval_value {
@@ -147,6 +218,19 @@ impl DefinitionFeature {
         xml_found
     }
 
+    /// Checks if the cursor is on a compute/inverse/search method name string.
+    ///
+    /// Odoo field definitions can reference methods by name:
+    /// ```python
+    /// total = fields.Float(compute='_compute_total', inverse='_inverse_total')
+    /// #                            ^^^^^^^^^^^^^^^^
+    /// ```
+    ///
+    /// Uses `FeaturesUtils::find_kwarg_methods_symbols` to resolve the method
+    /// name to actual method definitions on the current model.
+    ///
+    /// # Returns
+    /// `true` if this was a method reference and definitions were found.
     fn check_for_compute_string(session: &mut SessionInfo, eval: &Evaluation, file_symbol: &Rc<RefCell<Symbol>>, call_expr: &Option<ExprCall>, offset: usize, links: &mut Vec<LocationLink>) -> bool {
         let value = if let Some(eval_value) = eval.value.as_ref() {
             if let EvaluationValue::CONSTANT(Expr::StringLiteral(expr)) = eval_value {
@@ -176,11 +260,23 @@ impl DefinitionFeature {
         method_symbols.len() > 0
     }
 
+    /// Adds `_compute_display_name` method definitions for `display_name` field.
+    ///
+    /// The `display_name` field is synthetic (injected by Odoo), so when users
+    /// go-to-definition on it, we want to navigate to the `_compute_display_name`
+    /// method implementations instead.
+    ///
+    /// # Flow
+    /// 1. Check that we're on an attribute expression (e.g., `record.display_name`)
+    /// 2. Evaluate the base (`record`) to get its type
+    /// 3. Look up `_compute_display_name` on that type's model
+    /// 4. Add all implementations to the links
+    ///
+    /// # Arguments
+    /// * `expr` - The expression at cursor (should be an Attribute)
+    /// * `file_symbol` - Current file symbol
+    /// * `offset` - Cursor position
     pub fn add_display_name_compute_methods(session: &mut SessionInfo, links: &mut Vec<LocationLink>, expr: &ExprOrIdent, file_symbol: &Rc<RefCell<Symbol>>, offset: usize) {
-        // now we want `_compute_display_name` definition(s)
-        // we need the symbol of the model/ then we run get member symbol
-        // to do that, we need the expr, match it to attribute, get the value, get its evals
-        // with those evals, we run get_member_symbol on `_compute_display_name`
         let crate::core::evaluation::ExprOrIdent::Expr(Expr::Attribute(attr_expr)) = expr else {
             return;
         };
@@ -219,6 +315,29 @@ impl DefinitionFeature {
         }
     }
 
+    /// Main entry point for Python go-to-definition.
+    ///
+    /// Resolves the symbol at the cursor position and returns its definition location(s).
+    ///
+    /// # Processing Steps
+    ///
+    /// 1. **Find symbols**: Use `AstUtils::get_symbols` to find evaluations at cursor
+    /// 2. **Filter magic fields**: Remove synthetic fields like `display_name`, `env`
+    ///    that don't have real source locations
+    /// 3. **Handle display_name**: If filtered, add `_compute_display_name` implementations
+    /// 4. **Check special strings**: Try each special string handler in order:
+    ///    - Domain fields
+    ///    - Compute/inverse/search methods
+    ///    - Module dependencies
+    ///    - Model names
+    ///    - XML IDs
+    /// 5. **Skip literals**: Don't go-to-definition on plain constants
+    /// 6. **Handle import variables**: If on an import variable at its definition,
+    ///    follow to the source definition instead
+    /// 7. **Standard resolution**: Return the symbol's definition location
+    ///
+    /// # Returns
+    /// `GotoDefinitionResponse::Link` with `LocationLink` entries for each definition.
     pub fn get_location(session: &mut SessionInfo,
         file_symbol: &Rc<RefCell<Symbol>>,
         file_info: &Rc<RefCell<FileInfo>>,

@@ -22,6 +22,38 @@ use crate::core::file_mgr::FileInfo;
 use super::features_utils::TypeInfo;
 
 
+/// Represents the expected type context for completion suggestions.
+///
+/// This enum drives context-aware completion by indicating what kind of value
+/// is expected at the cursor position. It's propagated through the AST traversal
+/// and used by string literal and expression completion handlers.
+///
+/// # Variants
+///
+/// ## Model-related
+/// * `MODEL_NAME` - Complete Odoo model names like `"res.partner"`. Used in:
+///   - `_inherit` assignments
+///   - `self.env['...']` subscripts
+///   - `comodel_name` keyword arguments
+///
+/// ## Domain-related (for search domains like `[('field', '=', value)]`)
+/// * `DOMAIN(parent)` - Inside a domain list, attached to the model being searched
+/// * `DOMAIN_LIST(parent)` - Inside a domain tuple `(field, op, value)`
+/// * `DOMAIN_OPERATOR` - Complete `"&"`, `"|"`, `"!"` operators
+/// * `DOMAIN_FIELD(parent)` - Complete field names (first position in tuple)
+/// * `DOMAIN_COMPARATOR` - Complete `"="`, `"!="`, `"in"`, etc.
+///
+/// ## Field-related
+/// * `SIMPLE_FIELD(type)` - Simple field name from current model. Optional type filter.
+/// * `NESTED_FIELD(type)` - Dotted field path like `"partner_id.name"`. Used in:
+///   - `@api.depends()` decorators
+///   - `related` keyword arguments
+/// * `EXTERNAL_FIELD(model)` - Field on another model. Used in `inverse_name` kwargs.
+/// * `METHOD_NAME` - Method name string for `compute`, `inverse`, `search` kwargs.
+///
+/// ## Other
+/// * `CLASS(symbol)` - Complete class types (type annotations)
+/// * `INHERITS` - Special handling for `_inherits` dict (model -> field mapping)
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone)]
 pub enum ExpectedType {
@@ -39,10 +71,28 @@ pub enum ExpectedType {
     INHERITS,
 }
 
+/// Provides code autocompletion for Python files.
+///
+/// The completion system uses a recursive descent approach through the AST,
+/// maintaining context about what type of value is expected at each position.
 pub struct CompletionFeature;
 
 impl CompletionFeature {
-
+    /// Main entry point for autocompletion.
+    ///
+    /// Finds the statement at the cursor position and recursively descends through
+    /// the AST to find appropriate completions. Falls back to name completion if
+    /// no specific context is found.
+    ///
+    /// # Arguments
+    /// * `session` - Current session with server state
+    /// * `file_symbol` - Symbol representing the file
+    /// * `file_info` - File information including parsed AST
+    /// * `line` - Cursor line (0-indexed)
+    /// * `character` - Cursor column (0-indexed)
+    ///
+    /// # Returns
+    /// `CompletionResponse` with list of completion items, or `None` if no completions.
     pub fn autocomplete(session: &mut SessionInfo,
         file_symbol: &Rc<RefCell<Symbol>>,
         file_info: &Rc<RefCell<FileInfo>>,
@@ -525,6 +575,24 @@ fn complete_compare(session: &mut SessionInfo, file: &Rc<RefCell<Symbol>>, expr_
     None
 }
 
+/// Handles completion inside Odoo API decorator calls.
+///
+/// Provides field name completion for decorators like:
+/// * `@api.depends('field_name')` - Suggests nested field paths
+/// * `@api.onchange('field_name')` - Suggests simple field names
+/// * `@api.constrains('field_name')` - Suggests simple field names
+///
+/// # Arguments
+/// * `session` - Current session
+/// * `file` - File symbol for context
+/// * `offset` - Cursor position
+/// * `decorator` - The decorator AST node
+/// * `max_infer` - Maximum position for type inference
+///
+/// # Version Handling
+/// Accounts for decorator location changes between Odoo versions:
+/// * Pre-18.1: `odoo.api.depends`, `odoo.api.onchange`, etc.
+/// * 18.1+: `odoo.orm.decorators.depends`, etc.
 fn complete_decorator_call(
     session: &mut SessionInfo,
     file: &Rc<RefCell<Symbol>>,
@@ -581,6 +649,31 @@ fn complete_decorator_call(
     None
 }
 
+/// Handles completion inside function/method call expressions.
+///
+/// This is one of the most complex completion handlers as it provides context-aware
+/// completions based on what the function expects at each argument position.
+///
+/// # Completion Contexts
+///
+/// ## Positional Arguments
+/// 1. Evaluates the callable to determine parameter types
+/// 2. For field constructors (Many2one, etc.), first arg gets `MODEL_NAME` completion
+/// 3. For functions with `DOMAIN` parameter annotations, provides domain completion
+///
+/// ## Keyword Arguments
+/// For Odoo field constructors, handles special kwargs:
+/// * `comodel_name` → `MODEL_NAME` (for relational fields)
+/// * `related` → `NESTED_FIELD` (dotted field paths)
+/// * `inverse_name` → `EXTERNAL_FIELD` (field on comodel)
+/// * `compute`, `inverse`, `search` → `METHOD_NAME`
+///
+/// # Flow
+/// 1. If cursor is on the function name, delegate to expression completion
+/// 2. Evaluate the callable to get its type/symbol
+/// 3. For positional args: look up parameter type annotations
+/// 4. For keyword args: match against known Odoo field kwargs
+/// 5. Propagate appropriate `ExpectedType` to child completion
 fn complete_call(session: &mut SessionInfo, file: &Rc<RefCell<Symbol>>, expr_call: &ruff_python_ast::ExprCall, offset: usize, is_param: bool, expected_type: &Vec<ExpectedType>) -> Option<CompletionResponse> {
     if offset > expr_call.func.range().start().to_usize() && offset <= expr_call.func.range().end().to_usize() {
         return complete_expr( &expr_call.func, session, file, offset, is_param, expected_type);
@@ -682,6 +775,33 @@ fn complete_call(session: &mut SessionInfo, file: &Rc<RefCell<Symbol>>, expr_cal
     return complete_expr(&keyword.value, session, file, offset, is_param, &vec![]);
 }
 
+/// Handles completion inside string literals based on expected type context.
+///
+/// String completion is central to Odoo-specific features because many Odoo APIs
+/// use strings to reference models, fields, and methods.
+///
+/// # Handled ExpectedTypes
+///
+/// * `MODEL_NAME` - Lists all known models, filtered by prefix. Shows dependency
+///   warnings if model requires additional module dependencies.
+///
+/// * `DOMAIN_OPERATOR` - Suggests `"!"`, `"&"`, `"|"` for domain operators.
+///
+/// * `DOMAIN_COMPARATOR` - Suggests comparison operators: `"="`, `"!="`, `"in"`,
+///   `"like"`, `"child_of"`, etc.
+///
+/// * `DOMAIN_FIELD(parent)` - Suggests field names from the search domain's model,
+///   including dotted paths for relational fields.
+///
+/// * `SIMPLE_FIELD(type)` - Field names from current model, optionally filtered
+///   by field type (e.g., only Many2one fields).
+///
+/// * `NESTED_FIELD(type)` - Dotted field paths like `"partner_id.company_id.name"`,
+///   following relational fields.
+///
+/// * `EXTERNAL_FIELD(model)` - Field names on a different model (for `inverse_name`).
+///
+/// * `METHOD_NAME` - Method names from current model (for `compute` etc.).
 fn complete_string_literal(session: &mut SessionInfo, file: &Rc<RefCell<Symbol>>, expr_string_literal: &ruff_python_ast::ExprStringLiteral, _offset: usize, _is_param: bool, expected_type: &Vec<ExpectedType>) -> Option<CompletionResponse> {
     let mut items = vec![];
     let current_module = file.borrow().find_module();
@@ -893,6 +1013,27 @@ pub fn complete_tuple(session: &mut SessionInfo, file: &Rc<RefCell<Symbol>>, exp
     _complete_list_or_tuple(session, file, &expr_tuple.elts, offset, is_param, expected_type)
 }
 
+/// Handles completion inside list or tuple expressions.
+///
+/// This function implements the domain completion state machine, tracking position
+/// within domain expressions to provide appropriate completions.
+///
+/// # Domain Completion Flow
+///
+/// For `ExpectedType::DOMAIN(parent)` (top-level domain list):
+/// - String literals → `DOMAIN_OPERATOR` (for `"&"`, `"|"`, `"!"`)
+/// - Tuples/Lists → `DOMAIN_LIST(parent)` (for `(field, op, value)` items)
+///
+/// For `ExpectedType::DOMAIN_LIST(parent)` (inside domain tuple):
+/// - Position 0 → `DOMAIN_FIELD(parent)` (field name)
+/// - Position 1 → `DOMAIN_COMPARATOR` (operator)
+/// - Position 2+ → no special completion (value)
+///
+/// Also provides snippet completion for empty domain tuples:
+/// `(field, comparator, value)` with placeholders.
+///
+/// # Other Expected Types
+/// * `MODEL_NAME` - Propagated to list items (for `_inherit = [...]`)
 pub fn _complete_list_or_tuple(session: &mut SessionInfo, file: &Rc<RefCell<Symbol>>, list_or_tuple_elts: &Vec<Expr>, offset: usize, is_param: bool, expected_type: &Vec<ExpectedType>) -> Option<CompletionResponse> {
     for expected_type in expected_type.iter() {
         match expected_type {

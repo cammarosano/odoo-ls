@@ -4,6 +4,21 @@ use roxmltree::Node;
 
 use crate::{constants::OYarn, core::{evaluation::ContextValue, odoo::SyncOdoo, symbols::{module_symbol::ModuleSymbol, symbol::Symbol}, xml_data::OdooData}, threads::SessionInfo, Sy, S};
 
+/// Result type for XML symbol resolution.
+///
+/// When analyzing XML files, we can find either Python symbols (like model classes
+/// or fields) or XML data references (like record IDs).
+///
+/// # Variants
+///
+/// * `SYMBOL` - A Python symbol (model class, field, etc.) found in the XML
+/// * `XML_DATA` - An XML record reference with its file symbol and byte range
+///
+/// # Example Contexts
+///
+/// * `<record model="res.partner">` - `SYMBOL` pointing to `res.partner` model class
+/// * `<field name="partner_id">` - `SYMBOL` pointing to the field definition
+/// * `<field ref="sale.view_order_form"/>` - `XML_DATA` pointing to the referenced record
 pub enum XmlAstResult {
     SYMBOL(Rc<RefCell<Symbol>>),
     #[allow(non_camel_case_types)]
@@ -26,10 +41,53 @@ impl XmlAstResult {
     }
 }
 
+/// Utilities for analyzing XML files and finding symbols at cursor positions.
+///
+/// This struct handles XML-specific symbol resolution for LSP features like
+/// hover, definition, and references in Odoo XML data files.
+///
+/// # Supported XML Elements
+///
+/// | Element | Attributes | Resolution |
+/// |---------|------------|------------|
+/// | `<record>` | `model`, `id` | Model class, XML ID |
+/// | `<field>` | `name`, `ref` | Field symbol, XML ID reference |
+/// | `<menuitem>` | `action`, `groups` | XML ID references |
+/// | `<template>` | `inherit_id`, `groups` | XML ID references |
+///
+/// # Context Tracking
+///
+/// The visitor maintains context as it descends through the XML tree:
+/// * `record_model` - The model name from the enclosing `<record model="...">` 
+/// * `field_name` - The field name from the current `<field name="...">`
+///
+/// This context enables proper resolution of field names and text content.
 pub struct XmlAstUtils {}
 
 impl XmlAstUtils {
-
+    /// Finds symbols at a cursor position within an XML document.
+    ///
+    /// Traverses the XML document tree to find elements and attributes containing
+    /// the cursor, then resolves them to Python symbols or XML data references.
+    ///
+    /// # Arguments
+    /// * `session` - Current session with server state
+    /// * `file_symbol` - Symbol representing the XML file
+    /// * `root` - Root element of the parsed XML document
+    /// * `offset` - Byte offset of the cursor position
+    /// * `on_dep_only` - If true, filter results to only include symbols from
+    ///   modules that are dependencies of the current module
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// * `Vec<XmlAstResult>` - Found symbols and/or XML data references
+    /// * `Option<Range<usize>>` - The byte range of the matched attribute/element
+    ///
+    /// # Resolution Process
+    /// 1. Starts at root element and recursively visits children
+    /// 2. For each element, checks if cursor is within relevant attributes
+    /// 3. Resolves attribute values to symbols based on element type and attribute name
+    /// 4. Maintains context (`record_model`, `field_name`) for nested resolution
     pub fn get_symbols(session: &mut SessionInfo, file_symbol: &Rc<RefCell<Symbol>>, root: roxmltree::Node, offset: usize, on_dep_only: bool) -> (Vec<XmlAstResult>, Option<Range<usize>>) {
         let mut results = (vec![], None);
         let from_module = file_symbol.borrow().find_module();

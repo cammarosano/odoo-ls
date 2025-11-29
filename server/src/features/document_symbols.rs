@@ -7,6 +7,26 @@ use ruff_text_size::Ranged;
 use crate::{core::{file_mgr::FileInfo, python_utils::{unpack_assign, Assign, AssignTargetType}}, threads::SessionInfo, S};
 
 
+/// Provides document outline/symbol information.
+///
+/// Returns a hierarchical list of symbols in a document, used for:
+/// * Outline panel in the editor
+/// * Breadcrumb navigation
+/// * Go-to-symbol within document
+///
+/// # Python Symbol Mapping
+/// | Construct | SymbolKind | Children |
+/// |-----------|------------|----------|
+/// | `def func()` | FUNCTION | Parameters |
+/// | `class Cls:` | CLASS | Body symbols |
+/// | `var = val` | VARIABLE | None |
+///
+/// # XML Symbol Mapping  
+/// | Element | SymbolKind | Name Format |
+/// |---------|------------|-------------|
+/// | `<record>` | CLASS | `model / id` |
+/// | `<template>` | INTERFACE | `template / id` |
+/// | `<field>` | FIELD | `field_name` |
 pub struct DocumentSymbolFeature;
 
 impl DocumentSymbolFeature {

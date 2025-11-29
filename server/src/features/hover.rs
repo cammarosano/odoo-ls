@@ -10,10 +10,32 @@ use crate::features::features_utils::FeaturesUtils;
 use std::cell::RefCell;
 
 
+/// Provides hover information for Python and XML files.
+///
+/// The hover feature displays type information and documentation when users
+/// hover over symbols. It handles both Python code (using AST analysis and
+/// type evaluation) and XML files (using XML parsing and symbol lookup).
+///
+/// # Response Format
+/// Returns markdown-formatted content including:
+/// * Type signature (e.g., `(method) def compute(self) -> float`)
+/// * Source location links
+/// * Module information
+/// * Docstrings
 pub struct HoverFeature {}
 
 impl HoverFeature {
-
+    /// Provides hover information for Python files.
+    ///
+    /// # Flow
+    /// 1. Convert cursor position to byte offset
+    /// 2. Use `AstUtils::get_symbols` to find and evaluate symbols at cursor
+    /// 3. Build markdown description using `FeaturesUtils::build_markdown_description`
+    /// 4. Return `Hover` with content and highlighted range
+    ///
+    /// # Special Handling
+    /// * Odoo field strings (model names, compute methods, etc.) are resolved
+    ///   to their actual definitions via the call expression context
     pub fn hover_python(session: &mut SessionInfo, file_symbol: &Rc<RefCell<Symbol>>, file_info: &Rc<RefCell<FileInfo>>, line: u32, character: u32) -> Option<Hover> {
         let offset = file_info.borrow().position_to_offset(line, character, session.sync_odoo.encoding);
         let file_info_ast_clone = file_info.borrow().file_info_ast.clone();

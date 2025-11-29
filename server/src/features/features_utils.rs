@@ -19,14 +19,29 @@ use crate::threads::SessionInfo;
 use crate::{oyarn, Sy, S};
 
 
+/// Represents the signature of a callable (function or method) for display.
+///
+/// Used to format hover information showing function arguments and return types.
+///
+/// # Example Display
+/// For a function `def compute_total(self, vals: dict) -> float:`
+/// * `arguments`: `"self, vals: dict"`
+/// * `return_types`: `"float"`
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct CallableSignature {
     pub arguments: String,
     pub return_types: String,
 }
+
+/// Type information for display in hover and completion.
+///
+/// Distinguishes between callable types (functions/methods with signatures)
+/// and value types (variables, classes, modules, etc.).
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub enum TypeInfo {
+    /// A callable with argument list and return type
     CALLABLE(CallableSignature),
+    /// A value with its type name (e.g., "int", "RecordSet", "Any")
     VALUE(String),
 }
 impl TypeInfo {
@@ -42,9 +57,44 @@ struct InferredType {
     eval_ptr: EvaluationSymbolPtr,
     eval_info: TypeInfo,
 }
+
+/// Shared utilities for LSP feature implementations.
+///
+/// This struct provides common functionality used across hover, definition,
+/// and completion features, including:
+///
+/// * **Field resolution**: Finding Odoo fields referenced in strings
+/// * **Markdown building**: Formatting hover content with type info and docs
+/// * **Type inference display**: Converting evaluations to human-readable types
+///
+/// # Field Resolution Functions
+///
+/// These functions resolve Odoo-specific string patterns to their symbols:
+///
+/// * `find_kwarg_methods_symbols` - Resolves `compute`, `inverse`, `search` kwargs
+/// * `find_inverse_name_field_symbol` - Resolves `inverse_name` to field on comodel
+/// * `find_simple_decorator_field_symbol` - Resolves `@api.onchange`/`@api.constrains` args
+/// * `find_nested_fields` - Resolves dotted paths like `"partner_id.name"`
+/// * `find_domain_param_symbols` - Resolves fields in domain expressions
+/// * `find_argument_symbols` - Entry point dispatching to positional/keyword handlers
 pub struct FeaturesUtils {}
 
 impl FeaturesUtils {
+    /// Finds method symbols referenced by field constructor kwargs.
+    ///
+    /// Handles kwargs like `compute='_compute_total'`, `inverse='_inverse_total'`,
+    /// `search='_search_total'`, and `inverse_name='order_id'`.
+    ///
+    /// # Arguments
+    /// * `session` - Current session
+    /// * `scope` - Scope symbol for context
+    /// * `from_module` - Module for dependency resolution
+    /// * `field_value` - The string value (method/field name)
+    /// * `call_expr` - The field constructor call expression
+    /// * `offset` - Cursor position to identify which kwarg we're in
+    ///
+    /// # Returns
+    /// Vector of matching method symbols on the current model.
     pub fn find_kwarg_methods_symbols(
         session: &mut SessionInfo,
         scope: Rc<RefCell<Symbol>>,
@@ -313,6 +363,21 @@ impl FeaturesUtils {
         arg_symbols
     }
 
+    /// Entry point for finding symbols referenced by call arguments.
+    ///
+    /// Determines whether the cursor is on a positional or keyword argument,
+    /// then dispatches to the appropriate handler.
+    ///
+    /// # Positional Arguments
+    /// Handles special cases like:
+    /// * `@api.depends('field_name')` - field in decorator
+    /// * Domain parameters with `DOMAIN` type annotation
+    ///
+    /// # Keyword Arguments
+    /// Currently only handles the `related` kwarg for field constructors.
+    ///
+    /// # Returns
+    /// Vector of `(symbol, range)` pairs for matching field/method symbols.
     pub fn find_argument_symbols(
         session: &mut SessionInfo,
         scope: Rc<RefCell<Symbol>>,
@@ -349,6 +414,42 @@ impl FeaturesUtils {
         vec![]
     }
 
+    /// Builds markdown content for hover display.
+    ///
+    /// Creates a formatted markdown string showing type information, documentation,
+    /// and navigation links for the given evaluations.
+    ///
+    /// # Output Structure
+    ///
+    /// ```markdown
+    /// ```python
+    /// (tag) name: inferred_type
+    /// ```
+    ///
+    /// ---
+    /// See also: [name](path#offset)
+    ///
+    /// ---
+    /// From module `module_name`
+    /// Docstring content...
+    /// ```
+    ///
+    /// # Special Handling
+    ///
+    /// * **Model strings**: Shows all classes implementing the model, grouped by module
+    /// * **Module dependencies**: In manifests, shows module dependency tree
+    /// * **Field strings**: Resolves domain fields, compute methods, etc. via
+    ///   `check_for_string_special_syms`
+    /// * **Context injection**: Temporarily injects `base_attr` context for proper
+    ///   descriptor type resolution on field references
+    ///
+    /// # Arguments
+    /// * `session` - Current session
+    /// * `file_symbol` - Optional file symbol for context
+    /// * `file_path` - Optional file path (for manifest detection)
+    /// * `evals` - Evaluations to display
+    /// * `call_expr` - Optional enclosing call expression (for string resolution)
+    /// * `offset` - Optional cursor offset (for string resolution)
     pub fn build_markdown_description(
         session: &mut SessionInfo,
         file_symbol: Option<Rc<RefCell<Symbol>>>,
@@ -552,9 +653,21 @@ impl FeaturesUtils {
         }
     }
 
-    /// Return return type representation of evaluation
-    /// for a function evaluation it is typically (_arg: _arg_type, ...) -> (_result_type)
-    /// for variable it just shows the type, or Any if it fails to find it
+    /// Converts an evaluation pointer to displayable type information.
+    ///
+    /// For functions, returns a `CALLABLE` with argument list and return type.
+    /// For other symbols, returns a `VALUE` with the type name.
+    ///
+    /// # Type Inference
+    ///
+    /// * **Functions**: Extracts argument types from annotations, return types from
+    ///   evaluations. Shows `(args) -> return_type` format.
+    /// * **Classes**: Returns the class name. For `super`, shows `super[ClassName]`.
+    /// * **Files/Packages/Namespaces**: Returns descriptive type names.
+    /// * **Others**: Returns `"Any"` as fallback.
+    ///
+    /// # Context Usage
+    /// Uses the `base_call` context value to resolve `self` type in method return types.
     pub fn get_inferred_types(session: &mut SessionInfo, eval: &EvaluationSymbolPtr, context: &mut Option<Context>, symbol_type: &SymType) -> TypeInfo {
         if *symbol_type == SymType::CLASS{
             return TypeInfo::VALUE(S!(""));
