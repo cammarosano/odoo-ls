@@ -1,3 +1,37 @@
+//! XML Validation Phase Implementation
+//!
+//! This module implements the second phase (VALIDATION) of the XML two-phase build pipeline.
+//! After the ARCH phase has parsed XML structure and extracted XML IDs, this phase validates
+//! that referenced models and fields actually exist in the Python symbol table.
+//!
+//! # Build Pipeline Position
+//!
+//! ```text
+//! XML ARCH (xml_arch_builder.rs)
+//!     ↓
+//! Python ARCH_EVAL (must complete first)
+//!     ↓
+//! XML VALIDATION (this module)  ← Validates against Python symbols
+//! ```
+//!
+//! # Validation Checks
+//!
+//! | Element | Validation | Diagnostic |
+//! |---------|------------|------------|
+//! | `<record model="...">` | Model exists | OLS05056 |
+//! | `<record model="...">` | Model in dependencies | OLS05055 |
+//! | `<field name="...">` | Field exists on model | OLS05057 |
+//! | `<field ref="...">` | XML ID format valid | OLS05039, OLS05003, OLS05051 |
+//! | `<field>model</field>` | Model in text exists | OLS05055, OLS05056 |
+//!
+//! # Dependency Tracking
+//!
+//! This phase also records dependencies for incremental rebuilds:
+//! - Symbol dependencies: XML file → Python file defining the model
+//! - Model dependencies: XML file → Model struct
+//!
+//! When a Python model is modified, dependent XML files are re-validated.
+
 use std::{cell::RefCell, cmp::Ordering, collections::{HashMap, HashSet}, rc::Rc};
 
 use lsp_types::{Diagnostic, Position, Range};
@@ -7,6 +41,31 @@ use crate::{Sy, constants::{BuildSteps, DEBUG_STEPS, OYarn}, core::{diagnostics:
 
 
 
+/// Validator for the VALIDATION phase of XML processing.
+///
+/// The `XmlValidator` checks that models and fields referenced in XML data files
+/// actually exist in the Python symbol table. This validation runs after Python
+/// symbols have been built (ARCH_EVAL phase).
+///
+/// # Fields
+///
+/// * `xml_symbol` - The `XmlFileSymbol` being validated
+/// * `is_in_main_ep` - Whether the file is in MAIN/ADDON entry point
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut validator = XmlValidator::new(&entry, symbol.clone());
+/// validator.validate(session);
+/// // Diagnostics are published to the client
+/// ```
+///
+/// # Dependency Tracking
+///
+/// During validation, the validator records:
+/// - File dependencies (for rebuilding when models change)
+/// - Model dependencies (for tracking model changes)
+/// - Missing model names (for deferred validation when models are added)
 pub struct XmlValidator {
     pub xml_symbol: Rc<RefCell<Symbol>>,
     pub is_in_main_ep: bool,
@@ -14,6 +73,12 @@ pub struct XmlValidator {
 
 impl XmlValidator {
 
+    /// Creates a new XML validator for the given symbol.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry point containing this file
+    /// * `symbol` - The `XmlFileSymbol` to validate
     pub fn new(entry: &Rc<RefCell<EntryPoint>>, symbol: Rc<RefCell<Symbol>>) -> Self {
         let is_in_main_ep = entry.borrow().typ == EntryPointType::MAIN || entry.borrow().typ == EntryPointType::ADDON;
         Self {
@@ -22,6 +87,7 @@ impl XmlValidator {
         }
     }
 
+    /// Retrieves the file info for the XML file being validated.
     fn get_file_info(&mut self, odoo: &mut SyncOdoo) -> Rc<RefCell<FileInfo>> {
         let file_symbol = self.xml_symbol.borrow();
         let path = file_symbol.paths()[0].clone();
@@ -29,6 +95,20 @@ impl XmlValidator {
         file_info_rc
     }
 
+    /// Main entry point for the VALIDATION phase.
+    ///
+    /// Iterates through all XML IDs in the file and validates each one:
+    /// 1. For each `OdooData` in `xml_symbol.xml_ids`
+    /// 2. Dispatch to type-specific validator (`validate_record`, etc.)
+    /// 3. Track symbol and model dependencies
+    /// 4. Track missing models for deferred validation
+    /// 5. Publish diagnostics to the client
+    ///
+    /// # Side Effects
+    ///
+    /// - Adds dependencies to `xml_symbol` for incremental rebuilds
+    /// - Updates `not_found_symbols_for_models` for deferred validation
+    /// - Publishes diagnostics via `file_info.publish_diagnostics()`
     pub fn validate(&mut self, session: &mut SessionInfo) {
         if DEBUG_STEPS {
             trace!("Validating XML File {}", self.xml_symbol.borrow().name());
@@ -58,6 +138,17 @@ impl XmlValidator {
         file_info.borrow_mut().publish_diagnostics(session);
     }
 
+    /// Dispatches validation to the appropriate handler based on `OdooData` type.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session with server state
+    /// * `module` - The module containing this XML file
+    /// * `data` - The XML data to validate
+    /// * `diagnostics` - Collector for validation errors
+    /// * `dependencies` - Collector for file symbol dependencies
+    /// * `model_dependencies` - Collector for model dependencies
+    /// * `missing_model_dependencies` - Collector for models not found (for deferred validation)
     pub fn validate_xml_id(&self, session: &mut SessionInfo, module: &Rc<RefCell<Symbol>>, data: &OdooData, diagnostics: &mut Vec<Diagnostic>, dependencies: &mut Vec<Rc<RefCell<Symbol>>>, model_dependencies: &mut Vec<Rc<RefCell<Model>>>, missing_model_dependencies: &mut HashSet<OYarn>) {
         let Some(_) = data.get_xml_file_symbol() else {
             return;
@@ -69,6 +160,24 @@ impl XmlValidator {
             OdooData::DELETE(xml_data_delete) => self.validate_delete(session, module, xml_data_delete, diagnostics, dependencies, model_dependencies, missing_model_dependencies),
         }
     }
+
+    /// Validates a `<record>` element's model and fields.
+    ///
+    /// This is the main validation logic for records. It checks:
+    /// 1. Model exists in `sync_odoo.models`
+    /// 2. Model is accessible from the current module (via dependencies)
+    /// 3. Each field exists on the model (including inherited fields)
+    /// 4. Field `ref` attributes have valid XML ID format
+    /// 5. Special fields (`model`, `res_model`) reference existing models
+    ///
+    /// # Diagnostics
+    ///
+    /// - **OLS05056**: Model doesn't exist anywhere
+    /// - **OLS05055**: Model exists but not in module dependencies
+    /// - **OLS05057**: Field doesn't exist on the model
+    /// - **OLS05039**: Empty XML ID in `ref` attribute
+    /// - **OLS05003**: Unknown module in XML ID prefix
+    /// - **OLS05051**: Invalid XML ID format (too many dots)
     fn validate_record(&self, session: &mut SessionInfo, module: &Rc<RefCell<Symbol>>, xml_data_record: &OdooDataRecord, diagnostics: &mut Vec<Diagnostic>, dependencies: &mut Vec<Rc<RefCell<Symbol>>>, model_dependencies: &mut Vec<Rc<RefCell<Model>>>, missing_model_dependencies: &mut HashSet<OYarn>) {
         let maybe_model = session.sync_odoo.models.get(&xml_data_record.model.0).cloned();
         let model_exists = maybe_model.as_ref().map(|m| m.borrow_mut().has_symbols()).unwrap_or(false);
@@ -106,6 +215,26 @@ impl XmlValidator {
         self.validate_fields(session, xml_data_record, &all_fields, diagnostics, missing_model_dependencies);
     }
 
+    /// Validates field references within a record.
+    ///
+    /// For each field in the record, this method:
+    /// 1. Checks the field exists on the model (including inherited fields)
+    /// 2. Validates `ref` attribute XML ID format
+    /// 3. For special fields (`model`, `res_model`), validates the referenced model exists
+    /// 4. Handles Odoo 18.2+ translation syntax (`field_name@lang`)
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session with server state
+    /// * `xml_data_record` - The record containing fields to validate
+    /// * `all_fields` - Map of field names to their symbols (from `Symbol::all_fields`)
+    /// * `diagnostics` - Collector for validation errors
+    /// * `missing_model_dependencies` - Collector for models not found
+    ///
+    /// # Special Field Handling
+    ///
+    /// When the record's model is `ir.ui.view` or `ir.actions.act_window`, the `model`
+    /// or `res_model` field text content is validated as a model name.
     fn validate_fields(&self, session: &mut SessionInfo, xml_data_record: &OdooDataRecord, all_fields: &HashMap<OYarn, Vec<(Rc<RefCell<Symbol>>, Option<OYarn>)>>, diagnostics: &mut Vec<Diagnostic>, missing_model_dependencies: &mut HashSet<OYarn>) {
         //Compute mandatory fields
         let mut mandatory_fields: Vec<String> = vec![];
@@ -243,14 +372,26 @@ impl XmlValidator {
         // }
     }
 
+    /// Validates a `<menuitem>` element.
+    ///
+    /// Currently a placeholder - menuitem validation is handled during ARCH phase
+    /// in `xml_arch_builder_rng_validation.rs`.
     fn validate_menu_item(&self, _session: &mut SessionInfo, _module: &Rc<RefCell<Symbol>>, _xml_data_menu_item: &XmlDataMenuItem, _diagnostics: &mut Vec<Diagnostic>, _dependencies: &mut Vec<Rc<RefCell<Symbol>>>, _model_dependencies: &mut Vec<Rc<RefCell<Model>>>, _missing_model_dependencies: &mut HashSet<OYarn>) {
 
     }
 
+    /// Validates a `<template>` element.
+    ///
+    /// Currently a placeholder - template validation could be extended to check
+    /// QWeb syntax, inherit_id references, etc.
     fn validate_template(&self, _session: &mut SessionInfo, _module: &Rc<RefCell<Symbol>>, _xml_data_template: &XmlDataTemplate, _diagnostics: &mut Vec<Diagnostic>, _dependencies: &mut Vec<Rc<RefCell<Symbol>>>, _model_dependencies: &mut Vec<Rc<RefCell<Model>>>, _missing_model_dependencies: &mut HashSet<OYarn>) {
 
     }
 
+    /// Validates a `<delete>` element.
+    ///
+    /// Currently a placeholder - could be extended to validate the target model
+    /// and check the referenced XML ID exists.
     fn validate_delete(&self, _session: &mut SessionInfo, _module: &Rc<RefCell<Symbol>>, _xml_data_delete: &XmlDataDelete, _diagnostics: &mut Vec<Diagnostic>, _dependencies: &mut Vec<Rc<RefCell<Symbol>>>, _model_dependencies: &mut Vec<Rc<RefCell<Model>>>, _missing_model_dependencies: &mut HashSet<OYarn>) {
 
     }

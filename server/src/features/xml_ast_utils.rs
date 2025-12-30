@@ -197,12 +197,19 @@ impl XmlAstUtils {
             if model.is_empty() || field.is_empty() {
                 return;
             }
-            if field == "model" || field == "res_model" { //do not check model, let's assume it will contains a model name
+            if field == "model" || field == "res_model" {
+                // Special handling for fields that contain model names (e.g., ir.ui.view's "model" field)
+                // Resolve the text content as a model name for hover/definition
                 XmlAstUtils::add_model_result(session, node, from_module, results, on_dep_only);
             }
         }
     }
 
+    /// Visits a `<menuitem>` element and resolves `action` and `groups` attributes.
+    ///
+    /// Checks if the cursor is on:
+    /// - `action="..."` - Resolves to the referenced action's XML data
+    /// - `groups="..."` - Resolves to the referenced group's XML data
     fn visit_menu_item(session: &mut SessionInfo<'_>, node: &Node, offset: usize, from_module: Option<Rc<RefCell<Symbol>>>, ctxt: &mut HashMap<String, ContextValue>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
         for attr in node.attributes() {
             if attr.name() == "action" {
@@ -222,6 +229,12 @@ impl XmlAstUtils {
         }
     }
 
+    /// Visits a `<template>` element and resolves `inherit_id` and `groups` attributes.
+    ///
+    /// Templates (QWeb views) can inherit from other templates and be restricted to groups.
+    /// This method resolves:
+    /// - `inherit_id="..."` - The parent template's XML data
+    /// - `groups="..."` - The security group's XML data
     fn visit_template(session: &mut SessionInfo<'_>, node: &Node, offset: usize, from_module: Option<Rc<RefCell<Symbol>>>, ctxt: &mut HashMap<String, ContextValue>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
         for attr in node.attributes() {
             if attr.name() == "inherit_id" {
@@ -241,6 +254,18 @@ impl XmlAstUtils {
         }
     }
 
+    /// Resolves a model name from text content to model class symbols.
+    ///
+    /// Used when the cursor is on text content that represents a model name
+    /// (e.g., `<field name="model">res.partner</field>` in a view definition).
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session with server state
+    /// * `node` - The text node containing the model name
+    /// * `from_module` - Module for dependency filtering
+    /// * `results` - Output collector for resolved symbols
+    /// * `on_dep_only` - If true, filter to dependency-accessible symbols only
     fn add_model_result(session: &mut SessionInfo, node: &Node, from_module: Option<Rc<RefCell<Symbol>>>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
         if let Some(model) = session.sync_odoo.models.get(node.text().unwrap()).cloned() {
             let from_module = match on_dep_only {
@@ -252,6 +277,25 @@ impl XmlAstUtils {
         }
     }
 
+    /// Resolves an XML ID reference to its data record.
+    ///
+    /// Looks up the XML ID in the module's symbol table and returns matching
+    /// `XmlAstResult::XML_DATA` entries. Used for resolving `ref`, `action`,
+    /// `groups`, `inherit_id`, and similar attributes.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - Current session with server state
+    /// * `xml_id` - The XML ID to resolve (e.g., `"sale.view_order_form"`)
+    /// * `file_symbol` - The file containing the reference (for module context)
+    /// * `range` - Byte range of the XML ID in source
+    /// * `results` - Output collector for resolved symbols
+    /// * `on_dep_only` - If true, filter to IDs in dependency modules only
+    ///
+    /// # Note
+    ///
+    /// Currently only `RECORD` type XML data is returned; other types
+    /// (MENUITEM, TEMPLATE, DELETE) are not included in results.
     fn add_xml_id_result(session: &mut SessionInfo, xml_id: &str, file_symbol: &Rc<RefCell<Symbol>>, range: Range<usize>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
         let mut xml_ids = SyncOdoo::get_xml_ids(session, file_symbol, xml_id, &range, &mut vec![]);
         if on_dep_only {
